@@ -94,13 +94,17 @@
 
   /* ---------- calibration ---------- */
   #screen-calib{ padding:0; }
-  .calib-hud{ position:absolute; top:96px; left:0; right:0; text-align:center; z-index:20; }
+  .calib-hud{ position:absolute; top:96px; left:0; right:0; text-align:center; z-index:20; pointer-events:none; }
   .calib-hud .label{ font-size:11px; letter-spacing:.14em; color:var(--muted); text-transform:uppercase; }
   .calib-hud .pct{ font-family:'Fraunces',serif; font-size:32px; font-weight:600; color:var(--ink); margin-top:2px; }
   .calib-track{ width:220px; height:3px; background:var(--line); margin:12px auto 0; border-radius:2px; overflow:hidden; }
   .calib-track .bar{ height:100%; width:0%; background:var(--accent); transition:width .25s var(--ease); }
-  .calib-hint{ position:absolute; bottom:58px; left:0; right:0; text-align:center; font-size:12.5px; color:var(--muted); z-index:20; }
+  .calib-hint{ position:absolute; bottom:58px; left:0; right:0; text-align:center; font-size:12.5px; color:var(--muted); z-index:20; pointer-events:none; }
   .calib-hint b{ color:var(--ink); }
+  #btnCalibModeToggle{
+    position:absolute; bottom:16px; left:50%; transform:translateX(-50%); z-index:21;
+    margin-top:0; padding:8px 16px; font-size:11.5px;
+  }
 
   #calibGrid{ position:absolute; inset:0; }
   .calib-dot{ position:absolute; width:58px; height:58px; transform:translate(-50%,-50%); cursor:pointer; -webkit-tap-highlight-color:transparent; }
@@ -146,6 +150,7 @@
     position:fixed !important; right:calc(24px + env(safe-area-inset-right)) !important; bottom:calc(24px + env(safe-area-inset-bottom)) !important; top:auto !important; left:auto !important;
     width:120px !important; height:90px !important; border-radius:10px !important; overflow:hidden !important;
     z-index:109 !important; background:#eee !important; opacity:0; transition:opacity .4s ease;
+    pointer-events:none !important; /* it's a live preview, not a control -- never let it eat clicks on whatever's under it (e.g. the bottom-right calibration dot) */
   }
   body.camera-on #webgazerVideoContainer{ opacity:1; }
   #webgazerVideoFeed{ position:absolute !important; top:50% !important; left:50% !important; width:150% !important; height:150% !important; transform:translate(-50%,-50%) scaleX(-1) !important; object-fit:cover !important; }
@@ -285,7 +290,8 @@
         <div class="calib-track"><div class="bar" id="calibBar"></div></div>
       </div>
       <div id="calibGrid"></div>
-      <div class="calib-hint">Look directly at each dot and click it <b>5 times</b> before moving to the next.</div>
+      <div class="calib-hint" id="calibHint">Just look at each dot — we'll calibrate automatically.</div>
+      <button class="btn ghost" id="btnCalibModeToggle">Prefer clicking instead?</button>
     </section>
 
     <!-- READY -->
@@ -389,7 +395,7 @@
 
   <div id="camFrame">
     <div class="frame"></div>
-    <div class="caption">Camera preview</div>
+    <div class="caption" id="camCaption">Camera preview</div>
   </div>
 
   <footer class="credit">Runs entirely in this browser tab — powered by WebGazer.js</footer>
@@ -408,7 +414,7 @@
     var CALIB_POINTS = [
       [8,12],[50,10],[92,12],
       [8,50],[50,50],[92,50],
-      [8,88],[50,90],[92,88]
+      [8,88],[50,88],[92,88]
     ];
     var RING_R = 26;
     var RING_C = 2 * Math.PI * RING_R;
@@ -474,8 +480,8 @@
         window.removeEventListener('error', onWindowError);
         body.classList.add('camera-on');
         $('statusText').textContent = 'calibrating';
-        buildCalibrationGrid();
         showScreen('screen-calib');
+        startCalibration();
       }).catch(function (err) {
         if (settled) return;
         settled = true;
@@ -494,7 +500,39 @@
 
     /* ---------- calibration ---------- */
     var calibGrid = $('calibGrid');
+    var calibHint = $('calibHint');
+    var btnCalibModeToggle = $('btnCalibModeToggle');
 
+    var AUTO_DOT_MS = 1600;         // time spent per dot in hands-free mode
+    var AUTO_SAMPLE_EVERY_MS = 130; // how often we feed a training sample while dwelling on a dot
+    var calibMode = 'auto';         // 'auto' (hands-free, default) or 'manual' (click each dot)
+    var autoCalib = { sampleTimer: null, blinkHandler: null };
+
+    var CALIB_HINT_TEXT = {
+      auto: 'Just look at each dot — we\'ll calibrate automatically. Blinking helps confirm a fixation.',
+      manual: 'Look directly at each dot and click it <b>5 times</b> before moving to the next.'
+    };
+    var MODE_TOGGLE_TEXT = { auto: 'Prefer clicking instead?', manual: 'Switch to hands-free calibration' };
+
+    function setCalibMode(mode) {
+      calibMode = mode;
+      calibHint.innerHTML = CALIB_HINT_TEXT[mode];
+      btnCalibModeToggle.textContent = MODE_TOGGLE_TEXT[mode];
+    }
+    setCalibMode(calibMode);
+
+    btnCalibModeToggle.addEventListener('click', function () {
+      cancelAutoCalibration();
+      setCalibMode(calibMode === 'auto' ? 'manual' : 'auto');
+      startCalibration();
+    });
+
+    function startCalibration() {
+      if (calibMode === 'auto') startAutoCalibration();
+      else buildCalibrationGrid();
+    }
+
+    /* ----- manual: click each dot 5 times ----- */
     function buildCalibrationGrid() {
       calibGrid.innerHTML = '';
       state.calibCounts = new Array(CALIB_POINTS.length).fill(0);
@@ -533,11 +571,7 @@
       updateCalibProgress();
 
       if (state.calibCounts.every(function (c) { return c >= REQUIRED_CLICKS; })) {
-        setTimeout(function () {
-          $('statusText').textContent = 'calibrated';
-          body.classList.add('calibrated');
-          showScreen('screen-ready');
-        }, 240);
+        setTimeout(finishCalibration, 240);
       }
     }
 
@@ -549,14 +583,103 @@
       $('calibBar').style.width = pct + '%';
     }
 
+    /* ----- auto: hands-free, just look at each dot ----- */
+    function makeAutoDot(pt) {
+      var dot = document.createElement('div');
+      dot.className = 'calib-dot';
+      dot.style.left = pt[0] + '%';
+      dot.style.top = pt[1] + '%';
+      dot.innerHTML =
+        '<svg viewBox="0 0 60 60">' +
+          '<circle class="ring-bg" cx="30" cy="30" r="' + RING_R + '"/>' +
+          '<circle class="ring-fg" cx="30" cy="30" r="' + RING_R + '" style="stroke-dasharray:' + RING_C + '; stroke-dashoffset:' + RING_C + '"/>' +
+        '</svg>' +
+        '<span class="core"></span>';
+      return dot;
+    }
+
+    function cancelAutoCalibration() {
+      if (autoCalib.sampleTimer) { clearInterval(autoCalib.sampleTimer); autoCalib.sampleTimer = null; }
+      if (autoCalib.blinkHandler) { gaze.off('blink', autoCalib.blinkHandler); autoCalib.blinkHandler = null; }
+    }
+
+    function startAutoCalibration() {
+      cancelAutoCalibration();
+      calibGrid.innerHTML = '';
+      $('calibPct').textContent = '0%';
+      $('calibBar').style.width = '0%';
+      runAutoCalibDot(0);
+    }
+
+    function runAutoCalibDot(idx) {
+      if (idx >= CALIB_POINTS.length) { finishCalibration(); return; }
+
+      calibGrid.innerHTML = '';
+      var pt = CALIB_POINTS[idx];
+      var dot = makeAutoDot(pt);
+      calibGrid.appendChild(dot);
+      var ring = dot.querySelector('.ring-fg');
+      var px = (pt[0] / 100) * window.innerWidth;
+      var py = (pt[1] / 100) * window.innerHeight;
+
+      var elapsed = 0;
+      var bonus = 0;
+
+      autoCalib.blinkHandler = function () {
+        // A deliberate blink is a natural, low-effort "yes, I'm looking here"
+        // signal -- count it as a burst of extra progress on this dot.
+        dot.classList.add('pulse');
+        setTimeout(function () { dot.classList.remove('pulse'); }, 160);
+        bonus += AUTO_SAMPLE_EVERY_MS * 3;
+      };
+      gaze.on('blink', autoCalib.blinkHandler);
+
+      autoCalib.sampleTimer = setInterval(function () {
+        elapsed += AUTO_SAMPLE_EVERY_MS;
+        // A closed-eye frame has no usable pupil position -- skip feeding it
+        // rather than teach the model a wrong association.
+        if (!gaze.eyeState || !gaze.eyeState.closed) {
+          gaze.feedCalibrationPoint(px, py);
+        }
+        var dotPct = Math.min(1, (elapsed + bonus) / AUTO_DOT_MS);
+        ring.style.strokeDashoffset = RING_C * (1 - dotPct);
+
+        var overallPct = Math.round(((idx + dotPct) / CALIB_POINTS.length) * 100);
+        $('calibPct').textContent = overallPct + '%';
+        $('calibBar').style.width = overallPct + '%';
+
+        if (dotPct >= 1) {
+          clearInterval(autoCalib.sampleTimer);
+          autoCalib.sampleTimer = null;
+          gaze.off('blink', autoCalib.blinkHandler);
+          autoCalib.blinkHandler = null;
+          dot.classList.add('done');
+          setTimeout(function () { runAutoCalibDot(idx + 1); }, 200);
+        }
+      }, AUTO_SAMPLE_EVERY_MS);
+    }
+
+    function finishCalibration() {
+      cancelAutoCalibration();
+      $('statusText').textContent = 'calibrated';
+      body.classList.add('calibrated');
+      showScreen('screen-ready');
+    }
+
     function recalibrate() {
+      cancelAutoCalibration();
       gaze.clearCalibration();
-      buildCalibrationGrid();
       $('statusText').textContent = 'calibrating';
       showScreen('screen-calib');
+      startCalibration();
     }
     $('btnRecalFromReady').addEventListener('click', recalibrate);
     $('btnRecalFromResults').addEventListener('click', recalibrate);
+
+    /* ---------- eyes-closed indicator (camera preview caption) ---------- */
+    var camCaption = $('camCaption');
+    gaze.on('eyes-closed', function () { camCaption.textContent = 'Eyes closed'; });
+    gaze.on('eyes-open', function () { camCaption.textContent = 'Camera preview'; });
 
     /* ---------- gaze cursor trail ---------- */
     function resizeCanvas() { gazeCanvas.width = window.innerWidth; gazeCanvas.height = window.innerHeight; }
