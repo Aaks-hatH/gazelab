@@ -70,7 +70,20 @@
       // GitHub Pages), every request 404s and tracking silently never
       // starts. Pointing this at the public CDN build of the model fixes it
       // without requiring you to self-host anything.
-      faceMeshSolutionPath: './mediapipe/face_mesh'
+      faceMeshSolutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh',
+
+      // ---- eye-closure / blink detection ----
+      // We derive an Eye Aspect Ratio (EAR) each frame from the FaceMesh
+      // landmarks WebGazer already computes (eye height / eye width -- this
+      // shrinks toward 0 as the eyelids close). EAR varies a lot by face
+      // shape, camera angle and distance, so instead of a fixed threshold we
+      // track a slowly-adapting "eyes open" baseline per session and compare
+      // against that.
+      earClosedRatio: 0.62,   // eyes count as "closing" once EAR < baseline * this
+      earOpenRatio: 0.78,     // eyes count as "open" again once EAR > baseline * this (hysteresis avoids flicker right at the edge)
+      blinkMinMs: 60,         // closures shorter than this are treated as sensor noise, not a real blink
+      blinkMaxMs: 400,        // closures longer than this are a sustained close, not a blink
+      earBaselineAlpha: 0.02  // how fast the rolling "eyes open" baseline adapts (per frame)
     }, opts || {});
 
     this._listeners = {};
@@ -80,11 +93,25 @@
     this._dwellTargets = new Map();
     this._dwellRAF = null;
     this._confidenceTimer = null;
+    this._eyeLoopRAF = null;
+    this._earBaseline = null;
+    this._eyeClosedSince = null;
     this._started = false;
     this.current = null; // last smoothed {x,y}
+    // Live eye-openness read: ear (raw ratio), open/closed (debounced state),
+    // baseline (the adapted "eyes open" reference this session has settled on).
+    this.eyeState = { ear: null, open: null, closed: false, baseline: null };
   }
 
   var P = GazeEngine.prototype;
+
+  // MediaPipe FaceMesh 468-point indices used for a simple per-eye
+  // width/height ratio. "left"/"right" are from the subject's perspective,
+  // matching WebGazer's own facemesh.mjs eye landmark grouping.
+  var EYE_LANDMARKS = {
+    rightCornerOuter: 33, rightCornerInner: 133, rightUpperMid: 159, rightLowerMid: 145,
+    leftCornerOuter: 263, leftCornerInner: 362, leftUpperMid: 386, leftLowerMid: 374
+  };
 
   /* ---------------- events ---------------- */
 
@@ -179,6 +206,7 @@
       self._started = true;
       self._watchConfidence();
       self._runDwellLoop();
+      self._runEyeStateLoop();
       self._emit('ready', { tracker: useTracker });
       return self;
     }, function (err) {
@@ -208,6 +236,7 @@
 
   P.destroy = function () {
     if (this._dwellRAF) cancelAnimationFrame(this._dwellRAF);
+    if (this._eyeLoopRAF) cancelAnimationFrame(this._eyeLoopRAF);
     if (this._confidenceTimer) clearInterval(this._confidenceTimer);
     this._dwellTargets.clear();
     this._listeners = {};
@@ -220,6 +249,12 @@
   /* ---------------- signal processing ---------------- */
 
   P._ingest = function (x, y) {
+    // A frame captured mid-blink has no real pupil to track -- WebGazer will
+    // still emit *something*, but feeding it through smoothing just injects
+    // a garbage point. Drop it and let the existing buffer carry the cursor
+    // across the blink instead.
+    if (this.eyeState && this.eyeState.closed) return;
+
     var now = performance.now();
 
     if (this._lastRaw) {
@@ -254,12 +289,104 @@
     }, 300);
   };
 
+  /* ---------------- eye-closure / blink detection ---------------- */
+  // Runs off the same 468-point FaceMesh landmarks WebGazer's tracker already
+  // computes every frame (exposed via webgazer.getTracker().positionsArray),
+  // so this adds no extra model or camera work. Emits:
+  //   'blink'         -- a short, deliberate-looking close+reopen
+  //   'eyes-closed'   -- eyes have been shut past blinkMaxMs (still closed)
+  //   'eyes-open'     -- eyes reopened after any closure (blink or sustained)
+  // and keeps `this.eyeState` updated every frame for direct polling.
+
+  P._runEyeStateLoop = function () {
+    var self = this;
+
+    function dist(a, b) {
+      var dx = a[0] - b[0], dy = a[1] - b[1];
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+
+    function step() {
+      self._eyeLoopRAF = requestAnimationFrame(step);
+
+      if (typeof webgazer === 'undefined' || !webgazer.getTracker) return;
+      var tracker = webgazer.getTracker();
+      var pts = tracker && tracker.positionsArray;
+      // Only the FaceMesh tracker exposes per-landmark positions; if it
+      // hasn't produced a frame yet (or a future tracker doesn't support
+      // this), there's nothing to compute -- just wait for the next frame.
+      if (!pts || pts.length < 468) return;
+
+      var L = EYE_LANDMARKS;
+      var rW = dist(pts[L.rightCornerOuter], pts[L.rightCornerInner]);
+      var rH = dist(pts[L.rightUpperMid], pts[L.rightLowerMid]);
+      var lW = dist(pts[L.leftCornerOuter], pts[L.leftCornerInner]);
+      var lH = dist(pts[L.leftUpperMid], pts[L.leftLowerMid]);
+      if (!rW || !lW) return;
+
+      var ear = ((rH / rW) + (lH / lW)) / 2;
+      var now = performance.now();
+
+      if (self._earBaseline == null) {
+        self._earBaseline = ear;
+      } else if (!self.eyeState.closed) {
+        // Only drift the "eyes open" baseline while we believe eyes are
+        // open, so a slow blink doesn't drag the baseline down with it.
+        self._earBaseline += (ear - self._earBaseline) * self.opts.earBaselineAlpha;
+      }
+
+      var closedThresh = self._earBaseline * self.opts.earClosedRatio;
+      var openThresh = self._earBaseline * self.opts.earOpenRatio;
+
+      if (!self.eyeState.closed && ear < closedThresh) {
+        self.eyeState.closed = true;
+        self._eyeClosedSince = now;
+        self._sustainedFired = false;
+      } else if (self.eyeState.closed && ear > openThresh) {
+        self.eyeState.closed = false;
+        var closedMs = now - self._eyeClosedSince;
+        self._eyeClosedSince = null;
+        if (closedMs >= self.opts.blinkMinMs && closedMs <= self.opts.blinkMaxMs) {
+          self._emit('blink', { durationMs: closedMs });
+        }
+        self._emit('eyes-open', { durationMs: closedMs });
+      }
+
+      if (self.eyeState.closed && !self._sustainedFired &&
+          (now - self._eyeClosedSince) >= self.opts.blinkMaxMs) {
+        self._sustainedFired = true;
+        self._emit('eyes-closed', {});
+      }
+
+      self.eyeState.ear = ear;
+      self.eyeState.baseline = self._earBaseline;
+      self.eyeState.open = !self.eyeState.closed;
+    }
+
+    step();
+  };
+
   /* ---------------- calibration helpers ---------------- */
 
   // WebGazer trains itself from real click coordinates once begin() is active.
   // This just gives host UIs a clean event to hook progress bars, sounds, etc to.
   P.registerClick = function (x, y) {
     this._emit('calibration-click', { x: x, y: y });
+  };
+
+  // For hands-free / passive calibration flows where there is no real click
+  // to listen for (e.g. "just look at the dot"): feeds a training sample
+  // straight into WebGazer's regression model at the given screen point,
+  // using whatever the current eye features are. Call this repeatedly while
+  // the person is presumed to be looking at (x, y) -- e.g. while a dot is
+  // on screen -- to build up calibration data without any clicks or taps.
+  // Skip calling this while `eyeState.closed` is true; a closed-eye frame
+  // has no usable pupil position and would only add noise.
+  P.feedCalibrationPoint = function (x, y) {
+    if (typeof webgazer !== 'undefined' && webgazer.recordScreenPosition) {
+      webgazer.recordScreenPosition(x, y, 'click');
+    }
+    this._emit('calibration-feed', { x: x, y: y });
   };
 
   P.clearCalibration = function () {
