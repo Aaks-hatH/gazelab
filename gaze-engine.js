@@ -97,10 +97,24 @@
       // as growing error. weightedRidge lets fresh data -- including the
       // implicit recalibration from dwellSelect({calibrate:true}) below
       // -- gradually take over from the original calibration.
+      // NOTE: webgazer.setCameraConstraints() does NOT wrap this in a
+      // `video` key for you -- it stores exactly what you pass as
+      // webgazer.params.camConstraints and later calls
+      // navigator.mediaDevices.getUserMedia(webgazer.params.camConstraints)
+      // with it verbatim (see WebGazer's src/index.mjs). A bare
+      // {width, height, facingMode} object -- which is what WebGazer's own
+      // wiki example for setCameraConstraints shows -- has neither a
+      // `video` nor an `audio` key, so the browser rejects it outright with
+      // "Failed to execute 'getUserMedia' on 'MediaDevices': At least one
+      // of audio and video must be requested". WebGazer's actual default
+      // (params.mjs) nests these same properties under `video`, so we match
+      // that shape here instead of the wiki's (misleading) bare example.
       cameraConstraints: {
-        width: { min: 320, ideal: 1280, max: 1920 },
-        height: { min: 240, ideal: 720, max: 1080 },
-        facingMode: 'user'
+        video: {
+          width: { min: 320, ideal: 1280, max: 1920 },
+          height: { min: 240, ideal: 720, max: 1080 },
+          facingMode: 'user'
+        }
       },
       // Left unset, getUserMedia gets no resolution hint and a lot of
       // webcams default to a fairly small capture size. The FaceMesh eye
