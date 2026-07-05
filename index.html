@@ -411,9 +411,17 @@
     var FOCUS_DELAY = 700;
     var COLLECT_TIME = 900;
     var GAP = 350;
+    // 3x3 anchors plus a quadrant-center point between each pair of
+    // adjacent anchors (13 points total). A plain 3x3 grid leaves the
+    // regression model with nothing to interpolate from in between its
+    // anchors; the extra points are exactly where a linear model's error
+    // is largest. This is the same reasoning commercial trackers use when
+    // they step up from a 9-point calibration to a 13-point one.
     var CALIB_POINTS = [
       [8,12],[50,10],[92,12],
+      [29,31],[71,30],
       [8,50],[50,50],[92,50],
+      [29,69],[71,69],
       [8,88],[50,88],[92,88]
     ];
     var RING_R = 26;
@@ -503,10 +511,11 @@
     var calibHint = $('calibHint');
     var btnCalibModeToggle = $('btnCalibModeToggle');
 
-    var AUTO_DOT_MS = 1600;         // time spent per dot in hands-free mode
-    var AUTO_SAMPLE_EVERY_MS = 130; // how often we feed a training sample while dwelling on a dot
+    var AUTO_DOT_MS = 1900;         // total time spent per dot in hands-free mode
+    var AUTO_SETTLE_MS = 350;       // time given to saccade to a new dot + fixate before any sample counts
+    var AUTO_SAMPLE_EVERY_MS = 130; // how often we feed a training sample once settled
     var calibMode = 'auto';         // 'auto' (hands-free, default) or 'manual' (click each dot)
-    var autoCalib = { sampleTimer: null, blinkHandler: null };
+    var autoCalib = { cancel: null };
 
     var CALIB_HINT_TEXT = {
       auto: 'Just look at each dot — we\'ll calibrate automatically. Blinking helps confirm a fixation.',
@@ -599,8 +608,7 @@
     }
 
     function cancelAutoCalibration() {
-      if (autoCalib.sampleTimer) { clearInterval(autoCalib.sampleTimer); autoCalib.sampleTimer = null; }
-      if (autoCalib.blinkHandler) { gaze.off('blink', autoCalib.blinkHandler); autoCalib.blinkHandler = null; }
+      if (autoCalib.cancel) { autoCalib.cancel(); autoCalib.cancel = null; }
     }
 
     function startAutoCalibration() {
@@ -622,41 +630,31 @@
       var px = (pt[0] / 100) * window.innerWidth;
       var py = (pt[1] / 100) * window.innerHeight;
 
-      var elapsed = 0;
-      var bonus = 0;
-
-      autoCalib.blinkHandler = function () {
-        // A deliberate blink is a natural, low-effort "yes, I'm looking here"
-        // signal -- count it as a burst of extra progress on this dot.
+      // A deliberate blink is a natural, low-effort "yes, I'm looking here"
+      // signal -- calibrateDwell already counts it as bonus progress; this
+      // listener is only responsible for the visual pulse on the dot.
+      var pulseHandler = function () {
         dot.classList.add('pulse');
         setTimeout(function () { dot.classList.remove('pulse'); }, 160);
-        bonus += AUTO_SAMPLE_EVERY_MS * 3;
       };
-      gaze.on('blink', autoCalib.blinkHandler);
+      gaze.on('blink', pulseHandler);
 
-      autoCalib.sampleTimer = setInterval(function () {
-        elapsed += AUTO_SAMPLE_EVERY_MS;
-        // A closed-eye frame has no usable pupil position -- skip feeding it
-        // rather than teach the model a wrong association.
-        if (!gaze.eyeState || !gaze.eyeState.closed) {
-          gaze.feedCalibrationPoint(px, py);
-        }
-        var dotPct = Math.min(1, (elapsed + bonus) / AUTO_DOT_MS);
-        ring.style.strokeDashoffset = RING_C * (1 - dotPct);
-
-        var overallPct = Math.round(((idx + dotPct) / CALIB_POINTS.length) * 100);
-        $('calibPct').textContent = overallPct + '%';
-        $('calibBar').style.width = overallPct + '%';
-
-        if (dotPct >= 1) {
-          clearInterval(autoCalib.sampleTimer);
-          autoCalib.sampleTimer = null;
-          gaze.off('blink', autoCalib.blinkHandler);
-          autoCalib.blinkHandler = null;
+      autoCalib.cancel = gaze.calibrateDwell(px, py, {
+        ms: AUTO_DOT_MS,
+        settleMs: AUTO_SETTLE_MS,
+        sampleEveryMs: AUTO_SAMPLE_EVERY_MS,
+        onProgress: function (dotPct) {
+          ring.style.strokeDashoffset = RING_C * (1 - dotPct);
+          var overallPct = Math.round(((idx + dotPct) / CALIB_POINTS.length) * 100);
+          $('calibPct').textContent = overallPct + '%';
+          $('calibBar').style.width = overallPct + '%';
+        },
+        onDone: function () {
+          gaze.off('blink', pulseHandler);
           dot.classList.add('done');
           setTimeout(function () { runAutoCalibDot(idx + 1); }, 200);
         }
-      }, AUTO_SAMPLE_EVERY_MS);
+      });
     }
 
     function finishCalibration() {
@@ -676,10 +674,19 @@
     $('btnRecalFromReady').addEventListener('click', recalibrate);
     $('btnRecalFromResults').addEventListener('click', recalibrate);
 
-    /* ---------- eyes-closed indicator (camera preview caption) ---------- */
+    /* ---------- eyes-closed / tracking-confidence indicator (camera preview caption) ---------- */
     var camCaption = $('camCaption');
     gaze.on('eyes-closed', function () { camCaption.textContent = 'Eyes closed'; });
     gaze.on('eyes-open', function () { camCaption.textContent = 'Camera preview'; });
+    // GazeEngine already computed this signal (fires when no gaze sample has
+    // arrived in a while, e.g. the face left the frame) but nothing in the
+    // UI ever surfaced it -- so tracking could degrade silently with no way
+    // for the user to know to reposition themselves. Every recovered 'gaze'
+    // sample clears it back to the normal caption.
+    gaze.on('low-confidence', function () { camCaption.textContent = 'Can\u2019t see your face \u2014 recenter'; });
+    gaze.on('gaze', function () {
+      if (camCaption.textContent.indexOf('recenter') !== -1) camCaption.textContent = 'Camera preview';
+    });
 
     /* ---------- gaze cursor trail ---------- */
     function resizeCanvas() { gazeCanvas.width = window.innerWidth; gazeCanvas.height = window.innerHeight; }
@@ -880,6 +887,7 @@
       dwellTiles.forEach(function (t) {
         gaze.dwellSelect(t.el, {
           ms: 800,
+          calibrate: true, // every completed dwell is a free, natural recalibration sample
           onProgress: function (pct) { t.el.querySelector('.fill').style.height = (pct * 100) + '%'; },
           onSelect: function () {
             t.el.classList.add('locked');
@@ -988,6 +996,7 @@
       bubbles.push(b);
       gaze.dwellSelect(el, {
         ms: 550,
+        calibrate: true, // every popped bubble is a free, natural recalibration sample
         onProgress: function (pct) {
           el.classList.add('filling');
           el.querySelector('.ring').style.transform = 'scale(' + (0.6 + pct * 0.7) + ')';
