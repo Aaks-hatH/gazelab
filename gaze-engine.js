@@ -60,7 +60,17 @@
       outlierJumpPx: 420,      // ignore a jump bigger than this within outlierWindowMs
       outlierWindowMs: 120,
       lowConfidenceMs: 650,    // no samples for this long -> 'low-confidence'
-      trackerType: 'TFFacemesh'
+      trackerType: 'TFFacemesh',
+      // WebGazer's TFFacemesh tracker (MediaPipe FaceMesh) loads its model
+      // files at runtime from `webgazer.params.faceMeshSolutionPath`, which
+      // defaults to the *relative* path './mediapipe/face_mesh'. Relative
+      // paths resolve against the CURRENT PAGE'S origin, not against
+      // wherever webgazer.js itself was loaded from -- so on any page that
+      // doesn't happen to host those model files at that exact path (e.g.
+      // GitHub Pages), every request 404s and tracking silently never
+      // starts. Pointing this at the public CDN build of the model fixes it
+      // without requiring you to self-host anything.
+      faceMeshSolutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh'
     }, opts || {});
 
     this._listeners = {};
@@ -126,6 +136,13 @@
     var self = this;
     var useTracker = tracker || self.opts.trackerType;
 
+    // Must be set before begin() -- the TFFacemesh tracker reads this lazily
+    // on its first frame, but setting it up front avoids any race with the
+    // very first prediction. See the comment on faceMeshSolutionPath above.
+    if (webgazer.params && self.opts.faceMeshSolutionPath) {
+      webgazer.params.faceMeshSolutionPath = self.opts.faceMeshSolutionPath;
+    }
+
     webgazer.setRegression('ridge');
     if (webgazer.setTracker) { try { webgazer.setTracker(useTracker); } catch (e) {} }
     if (webgazer.saveDataAcrossSessions) webgazer.saveDataAcrossSessions(false);
@@ -165,14 +182,6 @@
       self._emit('ready', { tracker: useTracker });
       return self;
     }, function (err) {
-      // TFFacemesh is the most likely thing to break in odd, hard-to-diagnose
-      // ways (WebGL/TensorFlow.js quirks vary a lot by browser and GPU). If it
-      // fails and we haven't already fallen back, retry once with the older,
-      // dependency-light clmtrackr tracker before giving up entirely.
-      if (useTracker !== 'clmtrackr') {
-        try { webgazer.end(); } catch (e2) {}
-        return self._bootWebgazer('clmtrackr');
-      }
       var msg = (err && err.message) ? err.message : 'Camera failed to start.';
       var wrapped = new Error(msg);
       if (err && err.name) wrapped.name = err.name;
