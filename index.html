@@ -456,12 +456,30 @@
       btnStart.textContent = 'Requesting camera…';
       introError.style.display = 'none';
 
+      var settled = false;
+      var onWindowError = function (e) {
+        if (settled) return;
+        settled = true;
+        window.removeEventListener('error', onWindowError);
+        introError.textContent = 'Camera setup failed unexpectedly in this browser. Try a different browser (Chrome or Firefox tend to be most reliable) and reload the page.';
+        introError.style.display = 'block';
+        btnStart.disabled = false;
+        btnStart.textContent = 'Enable camera & begin';
+      };
+      window.addEventListener('error', onWindowError);
+
       gaze.start().then(function () {
+        if (settled) return;
+        settled = true;
+        window.removeEventListener('error', onWindowError);
         body.classList.add('camera-on');
         $('statusText').textContent = 'calibrating';
         buildCalibrationGrid();
         showScreen('screen-calib');
       }).catch(function (err) {
+        if (settled) return;
+        settled = true;
+        window.removeEventListener('error', onWindowError);
         introError.textContent = friendlyCameraError(err);
         introError.style.display = 'block';
         btnStart.disabled = false;
