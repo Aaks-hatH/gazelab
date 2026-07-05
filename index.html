@@ -1,978 +1,353 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
-<title>Gaze — Calibration</title>
+/*!
+ * GazeEngine — a small, dependency-light wrapper around WebGazer.js that adds
+ * the parts a real product needs on top of raw webcam gaze prediction:
+ *
+ *   - moving-average smoothing (raw WebGazer output is jittery, frame to frame)
+ *   - outlier rejection (drops impossible jumps caused by blinks / tracking loss)
+ *   - a confidence signal (fires when gaze samples stop arriving, e.g. face left frame)
+ *   - dwell-time "stare to select" interactions — the standard input method used
+ *     by real eye-gaze AAC (augmentative & alternative communication) devices
+ *   - a plain event API (on/off/emit) so any UI — a game, a settings panel,
+ *     a communication board — can consume gaze without touching WebGazer directly
+ *
+ * DROP-IN USAGE (works on any page, no build step):
+ *
+ *   <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
+ *   <script src="gaze-engine.js"></script>
+ *   <script>
+ *     const gaze = new GazeEngine();
+ *
+ *     await gaze.start();                    // requests camera, boots tracking
+ *
+ *     gaze.on('gaze', ({x, y}) => {           // smoothed point, every frame
+ *       cursorEl.style.left = x + 'px';
+ *       cursorEl.style.top  = y + 'px';
+ *     });
+ *
+ *     gaze.on('low-confidence', () => {       // face lost / tracking degraded
+ *       showBanner('Center your face in the camera preview');
+ *     });
+ *
+ *     // Calibration: place N dots on screen, have the user look + click each one
+ *     // several times. WebGazer trains itself off real click coordinates —
+ *     // registerClick() just re-emits a 'calibration-click' event for your UI.
+ *     dotEl.addEventListener('click', (e) => gaze.registerClick(e.clientX, e.clientY));
+ *
+ *     // Dwell-to-select: stare at any element for `ms` to "click" it.
+ *     gaze.dwellSelect(buttonEl, {
+ *       ms: 900,
+ *       onProgress: (pct) => ring.style.setProperty('--p', pct),
+ *       onSelect: () => speak('Yes')
+ *     });
+ *
+ *   </script>
+ *
+ * No React, no build tooling, no CSS required — this file only manages state
+ * and math. All rendering stays in the host page.
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.GazeEngine = factory();
+  }
+}(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
 
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;1,9..144,500&family=Work+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+  function GazeEngine(opts) {
+    this.opts = Object.assign({
+      smoothingWindow: 6,      // frames averaged together to steady the cursor
+      outlierJumpPx: 420,      // ignore a jump bigger than this within outlierWindowMs
+      outlierWindowMs: 120,
+      lowConfidenceMs: 650,    // no samples for this long -> 'low-confidence'
+      trackerType: 'TFFacemesh'
+    }, opts || {});
 
-<style>
-  :root{
-    --bg: #f2f3f1;
-    --surface: #ffffff;
-    --ink: #1c211f;
-    --muted: #767d78;
-    --line: #e1e4e0;
-    --accent: #2f6f6b;
-    --accent-soft: #dbe9e7;
-    --gold: #c9932e;
-    --radius: 14px;
-    --ease: cubic-bezier(.4,0,.2,1);
+    this._listeners = {};
+    this._buffer = [];
+    this._lastRaw = null;
+    this._lastSampleTime = 0;
+    this._dwellTargets = new Map();
+    this._dwellRAF = null;
+    this._confidenceTimer = null;
+    this._started = false;
+    this.current = null; // last smoothed {x,y}
   }
 
-  *{ box-sizing:border-box; margin:0; padding:0; }
-  html,body{ height:100%; overscroll-behavior:none; }
-  body{
-    background: var(--bg);
-    color: var(--ink);
-    font-family:'Work Sans', sans-serif;
-    overflow:hidden;
-    -webkit-tap-highlight-color: transparent;
-    touch-action: manipulation;
-  }
-  button, .calib-dot, .demo-tab, .tile{ touch-action: manipulation; }
-  h1, .display{ font-family:'Fraunces', serif; font-weight:500; }
-  .mono{ font-family:'IBM Plex Mono', monospace; }
+  var P = GazeEngine.prototype;
 
-  /* ---------- top bar ---------- */
-  .topbar{
-    position:fixed; top:0; left:0; right:0; z-index:80;
-    display:flex; align-items:center; justify-content:space-between;
-    padding:calc(22px + env(safe-area-inset-top)) calc(30px + env(safe-area-inset-right)) 22px calc(30px + env(safe-area-inset-left));
-  }
-  .brand{ display:flex; align-items:center; gap:9px; font-size:14px; letter-spacing:.01em; color:var(--ink); }
-  .brand svg{ width:18px; height:18px; color:var(--accent); }
-  .status{ font-size:11px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; }
-  #endBtn{
-    background:none; border:1px solid var(--line); color:var(--muted);
-    font-family:'Work Sans',sans-serif; font-size:11.5px; padding:7px 13px;
-    border-radius:20px; cursor:pointer; margin-left:14px; display:none;
-    transition: all .15s var(--ease);
-  }
-  #endBtn:hover{ border-color:var(--ink); color:var(--ink); }
-  body.camera-on #endBtn{ display:inline-block; }
+  /* ---------------- events ---------------- */
 
-  /* ---------- screens ---------- */
-  main{ position:relative; height:100vh; width:100vw; }
-  .screen{
-    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-    flex-direction:column; text-align:center; padding:40px;
-    opacity:0; transform:translateY(10px); pointer-events:none;
-    transition: opacity .35s var(--ease), transform .35s var(--ease);
-  }
-  .screen.active{ opacity:1; transform:translateY(0); pointer-events:auto; }
+  P.on = function (event, cb) {
+    (this._listeners[event] = this._listeners[event] || []).push(cb);
+    return this;
+  };
 
-  .eyebrow{ font-size:11.5px; letter-spacing:.14em; color:var(--accent); text-transform:uppercase; margin-bottom:16px; }
-  h1.title{ font-size: clamp(30px, 4.6vw, 48px); line-height:1.12; letter-spacing:-.01em; }
-  h1.title em{ font-style:italic; color:var(--accent); }
-  p.lede{ max-width:460px; margin:18px auto 0; color:var(--muted); font-size:14.5px; line-height:1.7; }
+  P.off = function (event, cb) {
+    if (!this._listeners[event]) return this;
+    this._listeners[event] = this._listeners[event].filter(function (fn) { return fn !== cb; });
+    return this;
+  };
 
-  .btn{
-    font-family:'Work Sans', sans-serif; font-weight:600; font-size:13.5px;
-    color:#fff; background:var(--ink); border:none; padding:14px 28px;
-    border-radius:30px; cursor:pointer; margin-top:32px;
-    transition: transform .15s var(--ease), background .15s var(--ease);
-  }
-  .btn:hover{ background:var(--accent); transform:translateY(-1px); }
-  .btn:active{ transform:translateY(0); }
-  .btn:disabled{ opacity:.45; cursor:not-allowed; transform:none; }
-  .btn.ghost{ background:transparent; color:var(--ink); border:1px solid var(--line); }
-  .btn.ghost:hover{ background:var(--surface); border-color:var(--ink); color:var(--ink); }
-  .btn:focus-visible{ outline:2px solid var(--gold); outline-offset:3px; }
-  .btn-row{ display:flex; gap:12px; flex-wrap:wrap; justify-content:center; }
-
-  #introError{
-    margin-top:20px; color:#a23e3e; font-size:12.5px; max-width:420px; line-height:1.6; display:none;
-  }
-
-  /* signature eye mark, quiet line art */
-  .eye-mark{ width:64px; height:64px; margin-bottom:22px; color:var(--accent); }
-  .eye-mark svg{ width:100%; height:100%; }
-
-  /* ---------- calibration ---------- */
-  #screen-calib{ padding:0; }
-  .calib-hud{ position:absolute; top:96px; left:0; right:0; text-align:center; z-index:20; }
-  .calib-hud .label{ font-size:11px; letter-spacing:.14em; color:var(--muted); text-transform:uppercase; }
-  .calib-hud .pct{ font-family:'Fraunces',serif; font-size:32px; font-weight:600; color:var(--ink); margin-top:2px; }
-  .calib-track{ width:220px; height:3px; background:var(--line); margin:12px auto 0; border-radius:2px; overflow:hidden; }
-  .calib-track .bar{ height:100%; width:0%; background:var(--accent); transition:width .25s var(--ease); }
-  .calib-hint{ position:absolute; bottom:58px; left:0; right:0; text-align:center; font-size:12.5px; color:var(--muted); z-index:20; }
-  .calib-hint b{ color:var(--ink); }
-
-  #calibGrid{ position:absolute; inset:0; }
-  .calib-dot{ position:absolute; width:58px; height:58px; transform:translate(-50%,-50%); cursor:pointer; -webkit-tap-highlight-color:transparent; }
-  .calib-dot svg{ width:100%; height:100%; transform:rotate(-90deg); }
-  .calib-dot .ring-bg{ fill:none; stroke:var(--line); stroke-width:2.4; }
-  .calib-dot .ring-fg{ fill:none; stroke:var(--accent); stroke-width:2.4; stroke-linecap:round; transition:stroke-dashoffset .2s var(--ease); }
-  .calib-dot .core{ position:absolute; top:50%; left:50%; width:10px; height:10px; margin:-5px 0 0 -5px; border-radius:50%; background:var(--muted); transition:all .2s var(--ease); }
-  .calib-dot.pulse .core{ transform:scale(1.5); }
-  .calib-dot.done .core{ background:var(--accent); }
-
-  /* ---------- test ---------- */
-  #screen-test{ padding:0; }
-  .test-hud{ position:absolute; top:96px; left:0; right:0; text-align:center; z-index:20; }
-  .test-hud .label{ font-size:11px; letter-spacing:.14em; color:var(--muted); text-transform:uppercase; }
-  .test-hud .count{ font-family:'Fraunces',serif; font-size:28px; font-weight:600; }
-  .test-hud .instr{ font-size:12px; color:var(--accent); margin-top:6px; min-height:16px; letter-spacing:.02em; }
-
-  .target{ position:absolute; width:40px; height:40px; transform:translate(-50%,-50%) scale(.5); opacity:0; transition:transform .3s var(--ease), opacity .3s var(--ease); pointer-events:none; }
-  .target.show{ opacity:1; transform:translate(-50%,-50%) scale(1); }
-  .target svg{ width:100%; height:100%; }
-  .target .ring{ fill:none; stroke:var(--gold); stroke-width:2; }
-  .target .center{ fill:var(--gold); }
-
-  #gazeCanvas{ position:fixed; inset:0; z-index:15; pointer-events:none; display:none; }
-  body.testing #gazeCanvas{ display:block; }
-
-  /* ---------- results ---------- */
-  #screen-results .resultsWrap{ display:flex; gap:44px; align-items:center; flex-wrap:wrap; justify-content:center; max-width:900px; }
-  #resultsCanvas{ background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); }
-  .stat-block{ text-align:left; min-width:230px; }
-  .rank{ font-size:12.5px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; }
-  .rank b{ display:block; font-family:'Fraunces',serif; font-size:30px; color:var(--ink); font-weight:600; margin-top:4px; }
-  .stat-line{ display:flex; justify-content:space-between; border-top:1px solid var(--line); padding:11px 0; font-size:13px; }
-  .stat-line span:last-child{ font-weight:600; }
-
-  /* ---------- camera preview ---------- */
-  #camFrame{ position:fixed; right:calc(24px + env(safe-area-inset-right)); bottom:calc(24px + env(safe-area-inset-bottom)); width:120px; height:90px; z-index:110; display:none; pointer-events:none; }
-  body.camera-on #camFrame{ display:block; }
-  #camFrame .frame{ position:absolute; inset:0; border-radius:10px; border:1px solid var(--line); box-shadow:0 6px 20px rgba(0,0,0,.06); }
-  #camFrame .caption{ position:absolute; top:100%; left:0; right:0; text-align:center; margin-top:7px; font-size:10px; letter-spacing:.08em; color:var(--muted); text-transform:uppercase; }
-
-  #webgazerVideoContainer{
-    position:fixed !important; right:calc(24px + env(safe-area-inset-right)) !important; bottom:calc(24px + env(safe-area-inset-bottom)) !important; top:auto !important; left:auto !important;
-    width:120px !important; height:90px !important; border-radius:10px !important; overflow:hidden !important;
-    z-index:109 !important; background:#eee !important; opacity:0; transition:opacity .4s ease;
-  }
-  body.camera-on #webgazerVideoContainer{ opacity:1; }
-  #webgazerVideoFeed{ position:absolute !important; top:50% !important; left:50% !important; width:150% !important; height:150% !important; transform:translate(-50%,-50%) scaleX(-1) !important; object-fit:cover !important; }
-
-  footer.credit{ position:fixed; bottom:14px; left:0; right:0; text-align:center; z-index:20; font-size:10px; letter-spacing:.08em; color:var(--muted); opacity:.7; pointer-events:none; }
-
-  /* ---------- demo nav pill ---------- */
-  #demoNavBtn{
-    background:none; border:1px solid var(--line); color:var(--muted);
-    font-family:'Work Sans',sans-serif; font-size:11.5px; padding:7px 13px;
-    border-radius:20px; cursor:pointer; margin-left:8px; display:none;
-    transition: all .15s var(--ease);
-  }
-  #demoNavBtn:hover{ border-color:var(--accent); color:var(--accent); }
-  body.calibrated #demoNavBtn{ display:inline-block; }
-
-  /* ---------- demos screen ---------- */
-  #screen-demos{ padding:0; align-items:stretch; justify-content:flex-start; }
-  .demo-tabs{
-    position:absolute; top:96px; left:0; right:0; z-index:20;
-    display:flex; gap:8px; justify-content:center;
-  }
-  .demo-tab{
-    font-family:'Work Sans',sans-serif; font-size:12px; font-weight:600; color:var(--muted);
-    background:var(--surface); border:1px solid var(--line); padding:8px 16px; border-radius:20px;
-    cursor:pointer; transition: all .15s var(--ease);
-  }
-  .demo-tab:hover{ color:var(--ink); }
-  .demo-tab.active{ background:var(--ink); color:#fff; border-color:var(--ink); }
-  .demo-panel{ position:absolute; inset:0; display:none; }
-  .demo-panel.active{ display:block; }
-  .demo-title{ position:absolute; top:150px; left:0; right:0; text-align:center; z-index:20; pointer-events:none; }
-  .demo-title .eyebrow{ margin-bottom:4px; }
-  .demo-title p{ max-width:420px; margin:6px auto 0; color:var(--muted); font-size:12.5px; line-height:1.6; }
-
-  /* dwell board */
-  #dwellBoard{
-    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
-    padding-top:230px;
-  }
-  .tile-grid{ display:grid; grid-template-columns:repeat(4, 128px); gap:16px; }
-  .tile{
-    position:relative; width:128px; height:96px; border-radius:12px; background:var(--surface);
-    border:1px solid var(--line); display:flex; align-items:center; justify-content:center;
-    font-size:14px; font-weight:600; color:var(--ink); overflow:hidden; cursor:default;
-  }
-  .tile .fill{ position:absolute; left:0; bottom:0; right:0; height:0%; background:var(--accent-soft); transition:height .05s linear; z-index:0; }
-  .tile .label{ position:relative; z-index:1; }
-  .tile.locked{ border-color:var(--accent); }
-  .tile.locked .fill{ background:var(--accent); }
-  .tile.locked .label{ color:#fff; }
-  .tile .emoji{ position:relative; z-index:1; font-size:26px; display:block; margin-bottom:4px; }
-  #dwellSpeech{
-    position:absolute; bottom:70px; left:0; right:0; text-align:center; z-index:20;
-    font-family:'Fraunces',serif; font-size:22px; min-height:30px; color:var(--accent);
-  }
-
-  /* heatmap */
-  #heatmapWrap{ position:absolute; inset:0; }
-  #mockPage{ position:absolute; inset:60px 60px 60px 60px; top:230px; background:var(--surface); border:1px solid var(--line); border-radius:var(--radius); overflow:hidden; }
-  #mockPage .m-nav{ height:44px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:18px; padding:0 20px; }
-  #mockPage .m-nav span{ width:44px; height:8px; border-radius:4px; background:var(--line); }
-  #mockPage .m-hero{ height:34%; margin:20px; border-radius:10px; background:var(--accent-soft); display:flex; align-items:center; justify-content:center; color:var(--accent); font-family:'Fraunces',serif; font-size:15px; }
-  #mockPage .m-cards{ display:flex; gap:16px; margin:0 20px; }
-  #mockPage .m-card{ flex:1; height:90px; border-radius:8px; background:var(--bg); border:1px solid var(--line); }
-  #heatCanvas{ position:absolute; inset:0; pointer-events:none; mix-blend-mode:multiply; opacity:.8; }
-  #heatmapStats{ position:absolute; bottom:70px; left:0; right:0; text-align:center; z-index:20; font-size:12px; color:var(--muted); }
-
-  /* bubble pop */
-  #bubbleWrap{ position:absolute; inset:0; overflow:hidden; }
-  .bubble{
-    position:absolute; width:56px; height:56px; border-radius:50%; will-change:transform;
-    background: radial-gradient(circle at 35% 30%, rgba(255,255,255,.9), rgba(47,111,107,.28) 60%, rgba(47,111,107,.12));
-    border:1px solid rgba(47,111,107,.35); display:flex; align-items:center; justify-content:center;
-  }
-  .bubble .ring{ position:absolute; inset:-4px; border-radius:50%; border:3px solid var(--gold); opacity:0; transform:scale(.6); transition:transform .05s linear, opacity .1s; }
-  .bubble.filling .ring{ opacity:1; }
-  .bubble.popped{ animation: pop .25s var(--ease) forwards; }
-  @keyframes pop{ to{ transform:scale(1.6); opacity:0; } }
-  #bubbleHud{ position:absolute; top:150px; left:0; right:0; text-align:center; z-index:20; }
-  #bubbleHud .score{ font-family:'Fraunces',serif; font-size:30px; font-weight:600; }
-  #bubbleHud .time{ font-size:12px; color:var(--muted); margin-top:2px; }
-  #bubbleStart{ position:absolute; bottom:70px; left:0; right:0; text-align:center; z-index:20; }
-
-  @media (prefers-reduced-motion: reduce){
-    *{ animation-duration:.001ms !important; transition-duration:.001ms !important; }
-  }
-  @media (max-width:640px){
-    .topbar{ padding:calc(16px + env(safe-area-inset-top)) calc(18px + env(safe-area-inset-right)) 16px calc(18px + env(safe-area-inset-left)); }
-    #camFrame, #webgazerVideoContainer{
-      width:84px !important; height:64px !important;
-      right:calc(14px + env(safe-area-inset-right)) !important; bottom:calc(14px + env(safe-area-inset-bottom)) !important;
+  P._emit = function (event, payload) {
+    var list = this._listeners[event];
+    if (!list) return;
+    for (var i = 0; i < list.length; i++) {
+      try { list[i](payload); } catch (e) { console.error('[GazeEngine] listener error:', e); }
     }
-    .calib-dot{ width:46px; height:46px; }
-    .demo-tabs{ flex-wrap:wrap; }
-  }
-</style>
-</head>
-<body>
+  };
 
-  <div class="topbar">
-    <div class="brand">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12Z"/><circle cx="12" cy="12" r="2.6"/></svg>
-      Gaze
-    </div>
-    <div>
-      <span class="status mono" id="statusText">idle</span>
-      <button id="demoNavBtn">Demos</button>
-      <button id="endBtn">End session</button>
-    </div>
-  </div>
+  /* ---------------- lifecycle ---------------- */
 
-  <main>
+  P.start = function () {
+    var self = this;
 
-    <!-- INTRO -->
-    <section class="screen active" id="screen-intro">
-      <div class="eye-mark">
-        <svg viewBox="0 0 64 64" fill="none" stroke="currentColor" stroke-width="1.4">
-          <path d="M4 32s10.5-18 28-18 28 18 28 18-10.5 18-28 18S4 32 4 32Z"/>
-          <circle cx="32" cy="32" r="8"/>
-        </svg>
-      </div>
-      <div class="eyebrow">Optical calibration</div>
-      <h1 class="title">Teach it to<br><em>see where you look.</em></h1>
-      <p class="lede">
-        A short webcam calibration, then a quick accuracy check. Everything runs locally in your browser — no video is ever uploaded.
-      </p>
-      <button class="btn" id="btnStart">Enable camera &amp; begin</button>
-      <div id="introError"></div>
-    </section>
-
-    <!-- CALIBRATION -->
-    <section class="screen" id="screen-calib">
-      <div class="calib-hud">
-        <div class="label">Calibrating</div>
-        <div class="pct mono" id="calibPct">0%</div>
-        <div class="calib-track"><div class="bar" id="calibBar"></div></div>
-      </div>
-      <div id="calibGrid"></div>
-      <div class="calib-hint">Look directly at each dot and click it <b>5 times</b> before moving to the next.</div>
-    </section>
-
-    <!-- READY -->
-    <section class="screen" id="screen-ready">
-      <div class="eyebrow">Calibration complete</div>
-      <h1 class="title">Ready to run<br><em>the accuracy test?</em></h1>
-      <p class="lede">
-        Eight targets will appear one at a time. Just hold your gaze on each — no clicking. You'll get a score and a plot of predicted vs. actual gaze at the end.
-      </p>
-      <div class="btn-row">
-        <button class="btn" id="btnRunTest">Start test</button>
-        <button class="btn ghost" id="btnRecalFromReady">Recalibrate</button>
-        <button class="btn ghost" id="btnDemosFromReady">Explore demos</button>
-      </div>
-    </section>
-
-    <!-- TEST -->
-    <section class="screen" id="screen-test">
-      <div class="test-hud">
-        <div class="label">Target</div>
-        <div class="count mono"><span id="targetCur">1</span> / <span id="targetTotal">8</span></div>
-        <div class="instr" id="testInstr">Hold your gaze</div>
-      </div>
-      <div id="targetLayer"></div>
-    </section>
-
-    <!-- RESULTS -->
-    <section class="screen" id="screen-results">
-      <div class="eyebrow">Test complete</div>
-      <h1 class="title" style="margin-bottom:28px;">Your precision report</h1>
-      <div class="resultsWrap">
-        <canvas id="resultsCanvas" width="420" height="310"></canvas>
-        <div class="stat-block">
-          <div class="rank">Rank<b id="rankLabel">—</b></div>
-          <div class="stat-line"><span>Precision score</span><span id="statScore">—</span></div>
-          <div class="stat-line"><span>Avg. gaze error</span><span id="statError">—</span></div>
-          <div class="stat-line"><span>Targets tracked</span><span id="statHits">—</span></div>
-          <div class="btn-row" style="justify-content:flex-start; margin-top:24px;">
-            <button class="btn" id="btnRetest">Run again</button>
-            <button class="btn ghost" id="btnRecalFromResults">Recalibrate</button>
-            <button class="btn ghost" id="btnDemosFromResults">Explore demos</button>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- DEMOS -->
-    <section class="screen" id="screen-demos">
-      <div class="demo-tabs">
-        <button class="demo-tab" data-demo="board">Dwell board</button>
-        <button class="demo-tab" data-demo="heatmap">Gaze heatmap</button>
-        <button class="demo-tab" data-demo="bubble">Bubble pop</button>
-        <button class="btn ghost" id="btnBackFromDemos" style="margin-top:0; padding:8px 16px; font-size:12px;">Back</button>
-      </div>
-
-      <!-- Dwell board: AAC-style stare-to-select communication grid -->
-      <div class="demo-panel" id="panel-board">
-        <div class="demo-title">
-          <div class="eyebrow">Stare to select</div>
-          <p>Hold your gaze on a tile for a beat — this is the core input method used by real eye-gaze AAC devices.</p>
-        </div>
-        <div id="dwellBoard"><div class="tile-grid" id="dwellGrid"></div></div>
-        <div id="dwellSpeech" class="mono"></div>
-      </div>
-
-      <!-- Heatmap: accumulated attention over a mock page -->
-      <div class="demo-panel" id="panel-heatmap">
-        <div class="demo-title">
-          <div class="eyebrow">Where you actually look</div>
-          <p>A live attention heatmap, built the same way real UX researchers analyze eye-tracking sessions.</p>
-        </div>
-        <div id="heatmapWrap">
-          <div id="mockPage">
-            <div class="m-nav"><span></span><span></span><span></span></div>
-            <div class="m-hero">Hero section</div>
-            <div class="m-cards"><div class="m-card"></div><div class="m-card"></div><div class="m-card"></div></div>
-          </div>
-          <canvas id="heatCanvas"></canvas>
-        </div>
-        <div id="heatmapStats" class="mono">—</div>
-      </div>
-
-      <!-- Bubble pop: dwell-controlled mini game -->
-      <div class="demo-panel" id="panel-bubble">
-        <div class="demo-title">
-          <div class="eyebrow">Gaze-controlled game</div>
-          <p>Pop bubbles just by looking at them. No mouse, no touch — 30 seconds on the clock.</p>
-        </div>
-        <div id="bubbleHud">
-          <div class="score mono" id="bubbleScore">0</div>
-          <div class="time mono" id="bubbleTime">30s</div>
-        </div>
-        <div id="bubbleWrap"></div>
-        <div id="bubbleStart"><button class="btn" id="btnBubbleStart">Start game</button></div>
-      </div>
-    </section>
-
-  </main>
-
-  <canvas id="gazeCanvas"></canvas>
-
-  <div id="camFrame">
-    <div class="frame"></div>
-    <div class="caption">Camera preview</div>
-  </div>
-
-  <footer class="credit">Runs entirely in this browser tab — powered by WebGazer.js</footer>
-
-  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
-  <script src="gaze-engine.js"></script>
-  <script>
-  (function () {
-    'use strict';
-
-    var REQUIRED_CLICKS = 5;
-    var TOTAL_TARGETS = 8;
-    var FOCUS_DELAY = 700;
-    var COLLECT_TIME = 900;
-    var GAP = 350;
-    var CALIB_POINTS = [
-      [8,12],[50,10],[92,12],
-      [8,50],[50,50],[92,50],
-      [8,88],[50,90],[92,88]
-    ];
-    var RING_R = 26;
-    var RING_C = 2 * Math.PI * RING_R;
-
-    var $ = function (id) { return document.getElementById(id); };
-    var body = document.body;
-    var screens = document.querySelectorAll('.screen');
-    var gazeCanvas = $('gazeCanvas');
-    var gctx = gazeCanvas.getContext('2d');
-
-    var gaze = new GazeEngine();
-
-    var state = { calibCounts: [], testResults: [], targetIndex: 0 };
-    var trail = [];
-    var canvasRAF = null;
-
-    function showScreen(id) {
-      screens.forEach(function (s) { s.classList.remove('active'); });
-      $(id).classList.add('active');
+    if (typeof webgazer === 'undefined') {
+      return Promise.reject(new Error('WebGazer failed to load (check your connection and reload the page).'));
+    }
+    if (!window.isSecureContext) {
+      return Promise.reject(new Error('Camera access requires HTTPS (or localhost). This page is not running in a secure context.'));
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('This browser does not support camera access.'));
     }
 
-    /* ---------- intro / start ---------- */
-    var btnStart = $('btnStart');
-    var introError = $('introError');
+    // NOTE: we deliberately do NOT open our own getUserMedia stream here before
+    // handing off to WebGazer. Acquiring the camera and releasing it right
+    // before WebGazer acquires it again creates a race that its default
+    // TFFacemesh tracker (TensorFlow.js + WebGL) does not handle cleanly on
+    // some browsers/GPUs — it throws an opaque internal error instead of a
+    // clean rejection. Letting WebGazer own the single getUserMedia call, and
+    // reading the real error out of its rejection, is both simpler and safer.
+    return self._bootWebgazer(self.opts.trackerType);
+  };
 
-    function friendlyCameraError(err) {
-      var name = err && err.name;
-      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
-        return 'Camera access was blocked. Check your browser\'s site permissions (or the OS-level camera permission on mobile) and try again.';
-      }
-      if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
-        return 'No camera was found on this device.';
-      }
-      if (name === 'NotReadableError' || name === 'TrackStartError') {
-        return 'Your camera is already in use by another app or tab. Close it and try again.';
-      }
-      if (name === 'OverconstrainedError') {
-        return 'Your camera doesn\'t support the requested settings.';
-      }
-      return (err && err.message) || 'Camera access failed. Check your browser\'s site permissions and try again.';
+  P._bootWebgazer = function (tracker) {
+    var self = this;
+    var useTracker = tracker || self.opts.trackerType;
+
+    webgazer.setRegression('ridge');
+    if (webgazer.setTracker) { try { webgazer.setTracker(useTracker); } catch (e) {} }
+    if (webgazer.saveDataAcrossSessions) webgazer.saveDataAcrossSessions(false);
+
+    var began;
+    try {
+      began = webgazer.begin();
+    } catch (e) {
+      began = Promise.reject(e);
     }
+    if (!began || typeof began.then !== 'function') began = Promise.resolve(began);
 
-    btnStart.addEventListener('click', function () {
-      btnStart.disabled = true;
-      btnStart.textContent = 'Requesting camera…';
-      introError.style.display = 'none';
-
-      var settled = false;
-      var onWindowError = function (e) {
-        if (settled) return;
-        settled = true;
-        window.removeEventListener('error', onWindowError);
-        introError.textContent = 'Camera setup failed unexpectedly in this browser. Try a different browser (Chrome or Firefox tend to be most reliable) and reload the page.';
-        introError.style.display = 'block';
-        btnStart.disabled = false;
-        btnStart.textContent = 'Enable camera & begin';
-      };
-      window.addEventListener('error', onWindowError);
-
-      gaze.start().then(function () {
-        if (settled) return;
-        settled = true;
-        window.removeEventListener('error', onWindowError);
-        body.classList.add('camera-on');
-        $('statusText').textContent = 'calibrating';
-        buildCalibrationGrid();
-        showScreen('screen-calib');
-      }).catch(function (err) {
-        if (settled) return;
-        settled = true;
-        window.removeEventListener('error', onWindowError);
-        introError.textContent = friendlyCameraError(err);
-        introError.style.display = 'block';
-        btnStart.disabled = false;
-        btnStart.textContent = 'Enable camera & begin';
-      });
+    // Race begin() against a timeout: if the tracking model can't load (slow
+    // network, blocked CDN, low-power mobile device) begin() otherwise never
+    // resolves and the UI is stuck forever on "Requesting camera...".
+    var timeout = new Promise(function (_, reject) {
+      setTimeout(function () { reject(new Error('Camera timed out starting up. Check your connection and try again.')); }, 15000);
     });
 
-    $('endBtn').addEventListener('click', function () {
-      gaze.destroy();
-      location.reload();
-    });
+    return Promise.race([began, timeout]).then(function () {
+      webgazer.showVideoPreview(true);
+      webgazer.showPredictionPoints(false);
+      webgazer.showFaceOverlay(false);
+      webgazer.showFaceFeedbackBox(false);
+      webgazer.clearData();
 
-    /* ---------- calibration ---------- */
-    var calibGrid = $('calibGrid');
+      self._fixMobileVideo();
 
-    function buildCalibrationGrid() {
-      calibGrid.innerHTML = '';
-      state.calibCounts = new Array(CALIB_POINTS.length).fill(0);
-      CALIB_POINTS.forEach(function (pt, i) {
-        var dot = document.createElement('div');
-        dot.className = 'calib-dot';
-        dot.style.left = pt[0] + '%';
-        dot.style.top = pt[1] + '%';
-        dot.dataset.index = i;
-        dot.innerHTML =
-          '<svg viewBox="0 0 60 60">' +
-            '<circle class="ring-bg" cx="30" cy="30" r="' + RING_R + '"/>' +
-            '<circle class="ring-fg" cx="30" cy="30" r="' + RING_R + '" style="stroke-dasharray:' + RING_C + '; stroke-dashoffset:' + RING_C + '"/>' +
-          '</svg>' +
-          '<span class="core"></span>';
-        dot.addEventListener('click', function (e) {
-          gaze.registerClick(e.clientX, e.clientY);
-          onCalibDotClick(dot, i);
-        });
-        calibGrid.appendChild(dot);
+      webgazer.setGazeListener(function (data) {
+        if (!data) return;
+        self._ingest(data.x, data.y);
       });
-      updateCalibProgress();
-    }
 
-    function onCalibDotClick(dot, idx) {
-      if (state.calibCounts[idx] >= REQUIRED_CLICKS) return;
-      state.calibCounts[idx]++;
-      var ring = dot.querySelector('.ring-fg');
-      var pct = state.calibCounts[idx] / REQUIRED_CLICKS;
-      ring.style.strokeDashoffset = RING_C * (1 - pct);
+      self._started = true;
+      self._watchConfidence();
+      self._runDwellLoop();
+      self._emit('ready', { tracker: useTracker });
+      return self;
+    }, function (err) {
+      // TFFacemesh is the most likely thing to break in odd, hard-to-diagnose
+      // ways (WebGL/TensorFlow.js quirks vary a lot by browser and GPU). If it
+      // fails and we haven't already fallen back, retry once with the older,
+      // dependency-light clmtrackr tracker before giving up entirely.
+      if (useTracker !== 'clmtrackr') {
+        try { webgazer.end(); } catch (e2) {}
+        return self._bootWebgazer('clmtrackr');
+      }
+      var msg = (err && err.message) ? err.message : 'Camera failed to start.';
+      var wrapped = new Error(msg);
+      if (err && err.name) wrapped.name = err.name;
+      throw wrapped;
+    });
+  };
 
-      dot.classList.add('pulse');
-      setTimeout(function () { dot.classList.remove('pulse'); }, 160);
+  // iOS Safari (and some Android WebViews) refuse to actually play a <video>
+  // element unless it is muted + playsinline. WebGazer's internal video feed
+  // sets neither, so on mobile the camera light turns on (permission granted)
+  // but the video frame never advances and no gaze data ever arrives.
+  P._fixMobileVideo = function () {
+    var vid = document.getElementById('webgazerVideoFeed');
+    if (!vid) return;
+    vid.setAttribute('playsinline', 'true');
+    vid.setAttribute('webkit-playsinline', 'true');
+    vid.muted = true;
+    var p = vid.play();
+    if (p && p.catch) p.catch(function () {});
+  };
 
-      if (state.calibCounts[idx] >= REQUIRED_CLICKS) dot.classList.add('done');
-      updateCalibProgress();
+  P.pause = function () { if (typeof webgazer !== 'undefined') webgazer.pause(); };
+  P.resume = function () { if (typeof webgazer !== 'undefined') webgazer.resume(); };
 
-      if (state.calibCounts.every(function (c) { return c >= REQUIRED_CLICKS; })) {
-        setTimeout(function () {
-          $('statusText').textContent = 'calibrated';
-          body.classList.add('calibrated');
-          showScreen('screen-ready');
-        }, 240);
+  P.destroy = function () {
+    if (this._dwellRAF) cancelAnimationFrame(this._dwellRAF);
+    if (this._confidenceTimer) clearInterval(this._confidenceTimer);
+    this._dwellTargets.clear();
+    this._listeners = {};
+    if (typeof webgazer !== 'undefined') { try { webgazer.end(); } catch (e) {} }
+    this._started = false;
+  };
+
+  P.isRunning = function () { return this._started; };
+
+  /* ---------------- signal processing ---------------- */
+
+  P._ingest = function (x, y) {
+    var now = performance.now();
+
+    if (this._lastRaw) {
+      var dt = now - this._lastSampleTime;
+      var dist = Math.hypot(x - this._lastRaw.x, y - this._lastRaw.y);
+      if (dt < this.opts.outlierWindowMs && dist > this.opts.outlierJumpPx) {
+        return; // discard: almost certainly a blink or momentary tracking glitch
       }
     }
+    this._lastRaw = { x: x, y: y };
+    this._lastSampleTime = now;
 
-    function updateCalibProgress() {
-      var total = REQUIRED_CLICKS * CALIB_POINTS.length;
-      var done = state.calibCounts.reduce(function (a, b) { return a + Math.min(b, REQUIRED_CLICKS); }, 0);
-      var pct = Math.round((done / total) * 100);
-      $('calibPct').textContent = pct + '%';
-      $('calibBar').style.width = pct + '%';
-    }
+    this._buffer.push({ x: x, y: y });
+    if (this._buffer.length > this.opts.smoothingWindow) this._buffer.shift();
 
-    function recalibrate() {
-      gaze.clearCalibration();
-      buildCalibrationGrid();
-      $('statusText').textContent = 'calibrating';
-      showScreen('screen-calib');
-    }
-    $('btnRecalFromReady').addEventListener('click', recalibrate);
-    $('btnRecalFromResults').addEventListener('click', recalibrate);
+    var sx = 0, sy = 0, n = this._buffer.length;
+    for (var i = 0; i < n; i++) { sx += this._buffer[i].x; sy += this._buffer[i].y; }
 
-    /* ---------- gaze cursor trail ---------- */
-    function resizeCanvas() { gazeCanvas.width = window.innerWidth; gazeCanvas.height = window.innerHeight; }
-    window.addEventListener('resize', resizeCanvas);
+    this.current = { x: sx / n, y: sy / n, raw: { x: x, y: y } };
+    this._emit('gaze', this.current);
+  };
 
-    function startCanvasLoop() {
-      resizeCanvas();
-      (function frame() {
-        gctx.clearRect(0, 0, gazeCanvas.width, gazeCanvas.height);
-        var now = performance.now();
-        trail = trail.filter(function (p) { return now - p.t < 450; });
-        trail.forEach(function (p) {
-          var age = (now - p.t) / 450;
-          gctx.beginPath();
-          gctx.arc(p.x, p.y, 3 + (1 - age) * 6, 0, Math.PI * 2);
-          gctx.fillStyle = 'rgba(47,111,107,' + ((1 - age) * 0.14).toFixed(3) + ')';
-          gctx.fill();
-        });
-        if (gaze.current) {
-          gctx.beginPath();
-          gctx.arc(gaze.current.x, gaze.current.y, 6, 0, Math.PI * 2);
-          gctx.fillStyle = 'rgba(47,111,107,0.85)';
-          gctx.fill();
-        }
-        canvasRAF = requestAnimationFrame(frame);
-      })();
-    }
-    function stopCanvasLoop() {
-      if (canvasRAF) cancelAnimationFrame(canvasRAF);
-      gctx.clearRect(0, 0, gazeCanvas.width, gazeCanvas.height);
-    }
-    gaze.on('gaze', function (g) { trail.push({ x: g.x, y: g.y, t: performance.now() }); });
+  P._watchConfidence = function () {
+    var self = this;
+    clearInterval(this._confidenceTimer);
+    this._confidenceTimer = setInterval(function () {
+      if (!self._lastSampleTime) return;
+      var idle = performance.now() - self._lastSampleTime;
+      if (idle > self.opts.lowConfidenceMs) {
+        self._emit('low-confidence', { idleMs: idle });
+      }
+    }, 300);
+  };
 
-    /* ---------- test ---------- */
-    var targetLayer = $('targetLayer');
+  /* ---------------- calibration helpers ---------------- */
 
-    $('btnRunTest').addEventListener('click', startTest);
-    $('btnRetest').addEventListener('click', startTest);
+  // WebGazer trains itself from real click coordinates once begin() is active.
+  // This just gives host UIs a clean event to hook progress bars, sounds, etc to.
+  P.registerClick = function (x, y) {
+    this._emit('calibration-click', { x: x, y: y });
+  };
 
-    function startTest() {
-      showScreen('screen-test');
-      state.testResults = [];
-      state.targetIndex = 0;
-      $('targetTotal').textContent = TOTAL_TARGETS;
-      body.classList.add('testing');
-      $('statusText').textContent = 'tracking';
-      startCanvasLoop();
-      runNextTarget();
-    }
+  P.clearCalibration = function () {
+    if (typeof webgazer !== 'undefined') webgazer.clearData();
+  };
 
-    function randomTargetPos() {
-      return [14 + Math.random() * 72, 20 + Math.random() * 62];
-    }
-
-    function runNextTarget() {
-      if (state.targetIndex >= TOTAL_TARGETS) { finishTest(); return; }
-      $('targetCur').textContent = state.targetIndex + 1;
-      $('testInstr').textContent = 'Hold your gaze';
-
-      var pos = randomTargetPos();
-      var el = document.createElement('div');
-      el.className = 'target';
-      el.style.left = pos[0] + '%';
-      el.style.top = pos[1] + '%';
-      el.innerHTML =
-        '<svg viewBox="0 0 40 40">' +
-          '<circle class="ring" cx="20" cy="20" r="13"/>' +
-          '<circle class="center" cx="20" cy="20" r="3"/>' +
-        '</svg>';
-      targetLayer.appendChild(el);
-      requestAnimationFrame(function () { el.classList.add('show'); });
-
+  // Shows how accurate current calibration is: samples gaze for `sampleMs` while
+  // the caller displays something at (xFrac, yFrac) of the viewport, and resolves
+  // with the average pixel error.
+  P.measureAccuracyAt = function (xFrac, yFrac, sampleMs) {
+    var self = this;
+    sampleMs = sampleMs || 800;
+    return new Promise(function (resolve) {
+      var targetX = xFrac * window.innerWidth;
+      var targetY = yFrac * window.innerHeight;
+      var samples = [];
+      var collector = function (g) { samples.push(g); };
+      self.on('gaze', collector);
       setTimeout(function () {
-        $('testInstr').textContent = 'Sampling…';
-        gaze.measureAccuracyAt(pos[0] / 100, pos[1] / 100, COLLECT_TIME).then(function (result) {
-          state.testResults.push({
-            fxTarget: pos[0] / 100,
-            fyTarget: pos[1] / 100,
-            predicted: result ? result.fpoint : null,
-            distance: result ? result.distance : null
-          });
-          el.classList.remove('show');
-          setTimeout(function () {
-            el.remove();
-            state.targetIndex++;
-            runNextTarget();
-          }, GAP);
+        self.off('gaze', collector);
+        if (!samples.length) return resolve(null);
+        var ax = 0, ay = 0;
+        samples.forEach(function (s) { ax += s.x; ay += s.y; });
+        ax /= samples.length; ay /= samples.length;
+        resolve({
+          distance: Math.hypot(ax - targetX, ay - targetY),
+          point: { x: ax, y: ay },
+          fpoint: { x: ax / window.innerWidth, y: ay / window.innerHeight }
         });
-      }, FOCUS_DELAY);
-    }
+      }, sampleMs);
+    });
+  };
 
-    function finishTest() {
-      stopCanvasLoop();
-      body.classList.remove('testing');
-      $('statusText').textContent = 'calibrated';
-      renderResults();
-      showScreen('screen-results');
-    }
+  /* ---------------- dwell-to-select ---------------- */
+  // The core interaction for hands-free / speech-free control: look at something
+  // long enough and it activates. This is how real eye-gaze AAC devices work.
 
-    /* ---------- results ---------- */
-    function computeRank(avgDist, hitRate) {
-      if (hitRate < 0.4) return 'D — Signal lost';
-      if (avgDist <= 80) return 'S — Excellent';
-      if (avgDist <= 150) return 'A — Sharp';
-      if (avgDist <= 250) return 'B — Steady';
-      if (avgDist <= 380) return 'C — Drifting';
-      return 'D — Recalibrate';
-    }
+  P.dwellSelect = function (el, config) {
+    config = Object.assign({ ms: 900, onSelect: null, onProgress: null, onEnter: null, onLeave: null }, config);
+    this._dwellTargets.set(el, Object.assign({ _acc: 0, _inside: false, _locked: false }, config));
+    var self = this;
+    return function () { self.cancelDwell(el); };
+  };
 
-    function renderResults() {
-      var valid = state.testResults.filter(function (r) { return r.predicted; });
-      var hitRate = valid.length / state.testResults.length;
-      var avgDist = valid.length ? valid.reduce(function (a, r) { return a + r.distance; }, 0) / valid.length : null;
-      var score = avgDist === null ? 0 : Math.max(0, Math.min(100, Math.round(100 - avgDist / 6)));
+  P.cancelDwell = function (el) {
+    this._dwellTargets.delete(el);
+  };
 
-      $('rankLabel').textContent = computeRank(avgDist === null ? 9999 : avgDist, hitRate);
-      $('statScore').textContent = score + '%';
-      $('statError').textContent = avgDist === null ? '—' : Math.round(avgDist) + ' px';
-      $('statHits').textContent = valid.length + ' / ' + state.testResults.length;
+  P.setDwellTime = function (el, ms) {
+    var cfg = this._dwellTargets.get(el);
+    if (cfg) cfg.ms = ms;
+  };
 
-      drawResultsCanvas(state.testResults);
-    }
+  P._runDwellLoop = function () {
+    var self = this;
+    var last = performance.now();
 
-    function drawResultsCanvas(results) {
-      var canvas = $('resultsCanvas');
-      var ctx = canvas.getContext('2d');
-      var w = canvas.width, h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
+    function step() {
+      var now = performance.now();
+      var dt = now - last;
+      last = now;
 
-      ctx.strokeStyle = '#eef0ee';
-      for (var gx = 0; gx <= w; gx += 42) { ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, h); ctx.stroke(); }
-      for (var gy = 0; gy <= h; gy += 42) { ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(w, gy); ctx.stroke(); }
+      if (self.current) {
+        self._dwellTargets.forEach(function (cfg, el) {
+          var r = el.getBoundingClientRect();
+          var inside = self.current.x >= r.left && self.current.x <= r.right &&
+                       self.current.y >= r.top && self.current.y <= r.bottom;
 
-      results.forEach(function (r) {
-        var tx = r.fxTarget * w, ty = r.fyTarget * h;
-
-        if (r.predicted) {
-          var px = r.predicted.x * w, py = r.predicted.y * h;
-          ctx.setLineDash([2, 4]);
-          ctx.strokeStyle = 'rgba(201,147,46,0.7)';
-          ctx.beginPath(); ctx.moveTo(tx, ty); ctx.lineTo(px, py); ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.beginPath(); ctx.arc(px, py, 4.5, 0, Math.PI * 2);
-          ctx.fillStyle = '#c9932e'; ctx.fill();
-        } else {
-          ctx.strokeStyle = '#a23e3e'; ctx.lineWidth = 1.3;
-          ctx.beginPath();
-          ctx.moveTo(tx - 5, ty - 5); ctx.lineTo(tx + 5, ty + 5);
-          ctx.moveTo(tx + 5, ty - 5); ctx.lineTo(tx - 5, ty + 5);
-          ctx.stroke();
-        }
-
-        ctx.strokeStyle = '#2f6f6b'; ctx.lineWidth = 1.4;
-        ctx.beginPath(); ctx.arc(tx, ty, 6, 0, Math.PI * 2); ctx.stroke();
-      });
-    }
-
-    /* ============================================================
-       DEMOS — built on top of the same GazeEngine instance (gaze)
-       that already ran calibration. Each demo exposes start()/stop()
-       so switching tabs or leaving the screen always cleans up
-       listeners, dwell registrations, timers and RAF loops.
-    ============================================================ */
-
-    function speak(text) {
-      if (!('speechSynthesis' in window)) return;
-      try {
-        window.speechSynthesis.cancel();
-        window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
-      } catch (e) {}
-    }
-
-    /* ---------- demo 1: dwell board (AAC-style stare-to-select) ---------- */
-    var dwellWords = [
-      { emoji: '👍', text: 'Yes' }, { emoji: '👎', text: 'No' },
-      { emoji: '➕', text: 'More' }, { emoji: '✋', text: 'Stop' },
-      { emoji: '🆘', text: 'Help' }, { emoji: '💧', text: 'Water' },
-      { emoji: '🙏', text: 'Thank you' }, { emoji: '⏸', text: 'Break' }
-    ];
-    var dwellGridEl = $('dwellGrid');
-    var dwellTiles = [];
-
-    function buildDwellBoard() {
-      if (dwellTiles.length) return;
-      dwellWords.forEach(function (w) {
-        var tile = document.createElement('div');
-        tile.className = 'tile';
-        tile.innerHTML = '<div class="fill"></div><span class="label"><span class="emoji">' + w.emoji + '</span>' + w.text + '</span>';
-        dwellGridEl.appendChild(tile);
-        dwellTiles.push({ el: tile, word: w.text });
-      });
-    }
-
-    function startDwellBoard() {
-      buildDwellBoard();
-      body.classList.add('testing');
-      startCanvasLoop();
-      dwellTiles.forEach(function (t) {
-        gaze.dwellSelect(t.el, {
-          ms: 800,
-          onProgress: function (pct) { t.el.querySelector('.fill').style.height = (pct * 100) + '%'; },
-          onSelect: function () {
-            t.el.classList.add('locked');
-            $('dwellSpeech').textContent = t.word;
-            speak(t.word);
-            setTimeout(function () {
-              t.el.classList.remove('locked');
-              t.el.querySelector('.fill').style.height = '0%';
-            }, 700);
+          if (inside) {
+            if (!cfg._inside) {
+              cfg._inside = true;
+              cfg._acc = 0;
+              cfg._locked = false;
+              if (cfg.onEnter) cfg.onEnter();
+            }
+            if (!cfg._locked) {
+              cfg._acc += dt;
+              var pct = Math.min(1, cfg._acc / cfg.ms);
+              if (cfg.onProgress) cfg.onProgress(pct);
+              if (pct >= 1) {
+                cfg._locked = true;
+                if (cfg.onSelect) cfg.onSelect();
+              }
+            }
+          } else if (cfg._inside) {
+            cfg._inside = false;
+            cfg._acc = 0;
+            cfg._locked = false;
+            if (cfg.onLeave) cfg.onLeave();
+            if (cfg.onProgress) cfg.onProgress(0);
           }
         });
-      });
-    }
-    function stopDwellBoard() {
-      dwellTiles.forEach(function (t) { gaze.cancelDwell(t.el); });
-      $('dwellSpeech').textContent = '';
-      body.classList.remove('testing');
-      stopCanvasLoop();
-    }
-
-    /* ---------- demo 2: gaze heatmap over a mock page ---------- */
-    var HEAT_W = 48, HEAT_H = 30;
-    var heatGrid = new Float32Array(HEAT_W * HEAT_H);
-    var heatCanvasEl = $('heatCanvas');
-    var heatCtx = heatCanvasEl.getContext('2d');
-    var heatSmall = document.createElement('canvas');
-    heatSmall.width = HEAT_W; heatSmall.height = HEAT_H;
-    var heatSmallCtx = heatSmall.getContext('2d');
-    var heatGazeHandler = null;
-    var heatTimer = null;
-    var heatSamples = 0;
-
-    function heatResize() {
-      heatCanvasEl.width = heatCanvasEl.offsetWidth;
-      heatCanvasEl.height = heatCanvasEl.offsetHeight;
-    }
-    function heatColor(t) {
-      var stops = [[64, 100, 210], [60, 190, 140], [235, 200, 60], [214, 64, 64]];
-      var n = stops.length - 1;
-      var idx = Math.min(n - 1, Math.floor(t * n));
-      var frac = t * n - idx;
-      var a = stops[idx], b = stops[idx + 1];
-      return [Math.round(a[0] + (b[0] - a[0]) * frac), Math.round(a[1] + (b[1] - a[1]) * frac), Math.round(a[2] + (b[2] - a[2]) * frac)];
-    }
-    function heatAccumulate(g) {
-      heatSamples++;
-      var gx = Math.floor(g.x / window.innerWidth * HEAT_W);
-      var gy = Math.floor(g.y / window.innerHeight * HEAT_H);
-      for (var dy = -2; dy <= 2; dy++) {
-        for (var dx = -2; dx <= 2; dx++) {
-          var xx = gx + dx, yy = gy + dy;
-          if (xx < 0 || yy < 0 || xx >= HEAT_W || yy >= HEAT_H) continue;
-          var dist = Math.hypot(dx, dy);
-          var w = Math.max(0, 1 - dist / 3);
-          heatGrid[yy * HEAT_W + xx] += w * 0.9;
-        }
       }
+      self._dwellRAF = requestAnimationFrame(step);
     }
-    function heatTick() {
-      var i, maxV = 0;
-      for (i = 0; i < heatGrid.length; i++) { heatGrid[i] *= 0.965; if (heatGrid[i] > maxV) maxV = heatGrid[i]; }
-      var img = heatSmallCtx.createImageData(HEAT_W, HEAT_H);
-      for (i = 0; i < heatGrid.length; i++) {
-        var t = maxV > 0 ? heatGrid[i] / maxV : 0;
-        var c = t < 0.02 ? [255, 255, 255] : heatColor(t);
-        var a = t < 0.02 ? 0 : Math.min(255, 50 + t * 200);
-        img.data[i * 4] = c[0]; img.data[i * 4 + 1] = c[1]; img.data[i * 4 + 2] = c[2]; img.data[i * 4 + 3] = a;
-      }
-      heatSmallCtx.putImageData(img, 0, 0);
-      heatCtx.clearRect(0, 0, heatCanvasEl.width, heatCanvasEl.height);
-      heatCtx.imageSmoothingEnabled = true;
-      heatCtx.drawImage(heatSmall, 0, 0, heatCanvasEl.width, heatCanvasEl.height);
-      $('heatmapStats').textContent = heatSamples + ' gaze samples captured';
-      heatTimer = setTimeout(heatTick, 66);
-    }
-    function startHeatmap() {
-      heatResize();
-      window.addEventListener('resize', heatResize);
-      heatGrid.fill(0);
-      heatSamples = 0;
-      heatGazeHandler = heatAccumulate;
-      gaze.on('gaze', heatGazeHandler);
-      heatTick();
-    }
-    function stopHeatmap() {
-      if (heatGazeHandler) { gaze.off('gaze', heatGazeHandler); heatGazeHandler = null; }
-      if (heatTimer) { clearTimeout(heatTimer); heatTimer = null; }
-      window.removeEventListener('resize', heatResize);
-    }
+    this._dwellRAF = requestAnimationFrame(step);
+  };
 
-    /* ---------- demo 3: bubble pop (dwell-controlled mini game) ---------- */
-    var bubbleWrapEl = $('bubbleWrap');
-    var bubbles = [];
-    var bubbleSpawnTimer = null, bubbleCountdownTimer = null, bubbleRAF = null;
-    var bubbleScore = 0, bubbleTimeLeft = 30, bubbleGameActive = false;
-
-    function spawnBubble() {
-      var el = document.createElement('div');
-      el.className = 'bubble';
-      el.innerHTML = '<div class="ring"></div>';
-      var x = 8 + Math.random() * 80;
-      el.style.left = x + '%';
-      el.style.top = '104%';
-      bubbleWrapEl.appendChild(el);
-      var b = { el: el, x: x, y: 104, speed: 0.12 + Math.random() * 0.10, phase: Math.random() * Math.PI * 2, popped: false };
-      bubbles.push(b);
-      gaze.dwellSelect(el, {
-        ms: 550,
-        onProgress: function (pct) {
-          el.classList.add('filling');
-          el.querySelector('.ring').style.transform = 'scale(' + (0.6 + pct * 0.7) + ')';
-        },
-        onLeave: function () { el.classList.remove('filling'); },
-        onSelect: function () { popBubble(b); }
-      });
-    }
-    function popBubble(b) {
-      if (b.popped) return;
-      b.popped = true;
-      bubbleScore++;
-      $('bubbleScore').textContent = bubbleScore;
-      b.el.classList.add('popped');
-      gaze.cancelDwell(b.el);
-      setTimeout(function () { removeBubble(b); }, 260);
-    }
-    function removeBubble(b) {
-      gaze.cancelDwell(b.el);
-      if (b.el.parentNode) b.el.parentNode.removeChild(b.el);
-      var idx = bubbles.indexOf(b);
-      if (idx >= 0) bubbles.splice(idx, 1);
-    }
-    function bubbleTick() {
-      bubbles.forEach(function (b) {
-        if (b.popped) return;
-        b.y -= b.speed;
-        b.phase += 0.02;
-        var wobble = Math.sin(b.phase) * 2;
-        b.el.style.top = b.y + '%';
-        b.el.style.left = (b.x + wobble) + '%';
-        if (b.y < -10) removeBubble(b);
-      });
-      bubbleRAF = requestAnimationFrame(bubbleTick);
-    }
-    function startBubbleGame() {
-      bubbleScore = 0; bubbleTimeLeft = 30;
-      $('bubbleScore').textContent = '0';
-      $('bubbleTime').textContent = bubbleTimeLeft + 's';
-      $('bubbleStart').style.display = 'none';
-      bubbleGameActive = true;
-      bubbleSpawnTimer = setInterval(spawnBubble, 650);
-      bubbleCountdownTimer = setInterval(function () {
-        bubbleTimeLeft--;
-        $('bubbleTime').textContent = bubbleTimeLeft + 's';
-        if (bubbleTimeLeft <= 0) endBubbleGame();
-      }, 1000);
-      bubbleRAF = requestAnimationFrame(bubbleTick);
-    }
-    function endBubbleGame() {
-      if (!bubbleGameActive) return;
-      bubbleGameActive = false;
-      clearInterval(bubbleSpawnTimer);
-      clearInterval(bubbleCountdownTimer);
-      if (bubbleRAF) cancelAnimationFrame(bubbleRAF);
-      bubbles.slice().forEach(removeBubble);
-      $('bubbleStart').style.display = 'block';
-      $('btnBubbleStart').textContent = 'Play again — scored ' + bubbleScore;
-    }
-    function startBubbleDemo() {
-      body.classList.add('testing');
-      startCanvasLoop();
-      $('btnBubbleStart').textContent = 'Start game';
-      $('bubbleStart').style.display = 'block';
-    }
-    function stopBubbleDemo() {
-      endBubbleGame();
-      body.classList.remove('testing');
-      stopCanvasLoop();
-    }
-    $('btnBubbleStart').addEventListener('click', startBubbleGame);
-
-    /* ---------- demo tab switching ---------- */
-    var demoTabs = document.querySelectorAll('.demo-tab');
-    var demoControllers = {
-      board: { start: startDwellBoard, stop: stopDwellBoard },
-      heatmap: { start: startHeatmap, stop: stopHeatmap },
-      bubble: { start: startBubbleDemo, stop: stopBubbleDemo }
-    };
-    var activeDemo = null;
-
-    function setActiveDemo(name) {
-      if (activeDemo && demoControllers[activeDemo]) demoControllers[activeDemo].stop();
-      demoTabs.forEach(function (t) { t.classList.toggle('active', t.dataset.demo === name); });
-      document.querySelectorAll('.demo-panel').forEach(function (p) { p.classList.toggle('active', p.id === 'panel-' + name); });
-      activeDemo = name;
-      if (demoControllers[name]) demoControllers[name].start();
-    }
-    function stopActiveDemo() {
-      if (activeDemo && demoControllers[activeDemo]) demoControllers[activeDemo].stop();
-      activeDemo = null;
-    }
-    demoTabs.forEach(function (t) { t.addEventListener('click', function () { setActiveDemo(t.dataset.demo); }); });
-
-    function enterDemos() {
-      showScreen('screen-demos');
-      setActiveDemo('board');
-    }
-    $('demoNavBtn').addEventListener('click', enterDemos);
-    $('btnDemosFromReady').addEventListener('click', enterDemos);
-    $('btnDemosFromResults').addEventListener('click', enterDemos);
-    $('btnBackFromDemos').addEventListener('click', function () {
-      stopActiveDemo();
-      showScreen('screen-ready');
-    });
-
-  })();
-  </script>
-
-</body>
-</html>
+  return GazeEngine;
+}));
