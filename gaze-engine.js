@@ -70,7 +70,7 @@
       // GitHub Pages), every request 404s and tracking silently never
       // starts. Pointing this at the public CDN build of the model fixes it
       // without requiring you to self-host anything.
-      faceMeshSolutionPath: 'https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh'
+      faceMeshSolutionPath: './mediapipe/face_mesh'
     }, opts || {});
 
     this._listeners = {};
