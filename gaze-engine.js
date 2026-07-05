@@ -112,35 +112,37 @@
       return Promise.reject(new Error('This browser does not support camera access.'));
     }
 
-    // Ask for the camera ourselves first, instead of letting WebGazer do it
-    // internally. This gives us a real, specific error (permission denied, no
-    // camera, camera already in use, etc.) instead of a silent hang, which is
-    // the actual root cause of "allow was clicked but nothing happens": WebGazer's
-    // own begin() can stall indefinitely if its tracking model fails to load,
-    // with zero feedback to the page.
-    return navigator.mediaDevices.getUserMedia({
-      video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }
-    }).then(function (stream) {
-      stream.getTracks().forEach(function (t) { t.stop(); });
-      return self._bootWebgazer();
-    });
+    // NOTE: we deliberately do NOT open our own getUserMedia stream here before
+    // handing off to WebGazer. Acquiring the camera and releasing it right
+    // before WebGazer acquires it again creates a race that its default
+    // TFFacemesh tracker (TensorFlow.js + WebGL) does not handle cleanly on
+    // some browsers/GPUs — it throws an opaque internal error instead of a
+    // clean rejection. Letting WebGazer own the single getUserMedia call, and
+    // reading the real error out of its rejection, is both simpler and safer.
+    return self._bootWebgazer(self.opts.trackerType);
   };
 
-  P._bootWebgazer = function () {
+  P._bootWebgazer = function (tracker) {
     var self = this;
+    var useTracker = tracker || self.opts.trackerType;
 
     webgazer.setRegression('ridge');
-    if (webgazer.setTracker) { try { webgazer.setTracker(self.opts.trackerType); } catch (e) {} }
+    if (webgazer.setTracker) { try { webgazer.setTracker(useTracker); } catch (e) {} }
     if (webgazer.saveDataAcrossSessions) webgazer.saveDataAcrossSessions(false);
 
-    var began = webgazer.begin();
+    var began;
+    try {
+      began = webgazer.begin();
+    } catch (e) {
+      began = Promise.reject(e);
+    }
+    if (!began || typeof began.then !== 'function') began = Promise.resolve(began);
+
     // Race begin() against a timeout: if the tracking model can't load (slow
     // network, blocked CDN, low-power mobile device) begin() otherwise never
     // resolves and the UI is stuck forever on "Requesting camera...".
     var timeout = new Promise(function (_, reject) {
-      setTimeout(function () {
-        reject(new Error('Camera timed out starting up. Check your connection and try again.'));
-      }, 20000);
+      setTimeout(function () { reject(new Error('Camera timed out starting up. Check your connection and try again.')); }, 15000);
     });
 
     return Promise.race([began, timeout]).then(function () {
@@ -160,8 +162,21 @@
       self._started = true;
       self._watchConfidence();
       self._runDwellLoop();
-      self._emit('ready');
+      self._emit('ready', { tracker: useTracker });
       return self;
+    }, function (err) {
+      // TFFacemesh is the most likely thing to break in odd, hard-to-diagnose
+      // ways (WebGL/TensorFlow.js quirks vary a lot by browser and GPU). If it
+      // fails and we haven't already fallen back, retry once with the older,
+      // dependency-light clmtrackr tracker before giving up entirely.
+      if (useTracker !== 'clmtrackr') {
+        try { webgazer.end(); } catch (e2) {}
+        return self._bootWebgazer('clmtrackr');
+      }
+      var msg = (err && err.message) ? err.message : 'Camera failed to start.';
+      var wrapped = new Error(msg);
+      if (err && err.name) wrapped.name = err.name;
+      throw wrapped;
     });
   };
 
