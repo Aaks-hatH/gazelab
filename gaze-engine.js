@@ -34,10 +34,26 @@
  *     dotEl.addEventListener('click', (e) => gaze.registerClick(e.clientX, e.clientY));
  *
  *     // Dwell-to-select: stare at any element for `ms` to "click" it.
+ *     // `calibrate: true` also feeds the dwell target's center back into
+ *     // the regression model while the user is looking at it -- every
+ *     // real selection doubles as a free calibration sample, the same
+ *     // way WebGazer treats ordinary mouse clicks on a normal webpage.
  *     gaze.dwellSelect(buttonEl, {
  *       ms: 900,
+ *       calibrate: true,
  *       onProgress: (pct) => ring.style.setProperty('--p', pct),
  *       onSelect: () => speak('Yes')
+ *     });
+ *
+ *     // calibrateDwell() is the primitive a calibration screen builds on:
+ *     // it waits for the eye to saccade to (x, y) and settle before it
+ *     // starts recording samples, so a hands-free "just look at each dot"
+ *     // pass doesn't mislabel mid-saccade frames as belonging to the new
+ *     // target.
+ *     gaze.calibrateDwell(dotX, dotY, {
+ *       ms: 1900,
+ *       onProgress: (pct) => ring.style.setProperty('--p', pct),
+ *       onDone: () => nextDot()
  *     });
  *
  *   </script>
@@ -56,11 +72,43 @@
 
   function GazeEngine(opts) {
     this.opts = Object.assign({
-      smoothingWindow: 6,      // frames averaged together to steady the cursor
+      smoothingWindow: 4,      // frames averaged together to steady the cursor.
+      // WebGazer applies its own Kalman filter to raw predictions before
+      // they ever reach us (on by default -- see applyKalmanFilter below),
+      // so this moving average only needs to mop up residual jitter, not
+      // do the primary smoothing. The previous window of 6 frames
+      // (~200ms at 30fps) stacked on top of that filter added more lag
+      // than it removed noise: the displayed cursor kept "catching up" to
+      // a fixation well after the eye had actually settled, which both
+      // reads as inaccurate and eats into the usable window for
+      // dwell-to-select. 4 frames keeps most of the jitter reduction with
+      // less than half the added latency.
       outlierJumpPx: 420,      // ignore a jump bigger than this within outlierWindowMs
       outlierWindowMs: 120,
       lowConfidenceMs: 650,    // no samples for this long -> 'low-confidence'
       trackerType: 'TFFacemesh',
+      regression: 'weightedRidge',
+      // WebGazer's default, 'ridge', weighs every training sample the
+      // same forever. 'weightedRidge' weighs recent samples more heavily.
+      // That matters here because calibration is a one-time upfront pass:
+      // with plain ridge, predictions stay anchored to the exact head
+      // pose/lighting present during that one pass, and any drift later
+      // in the session (the user leans back, lighting shifts) just reads
+      // as growing error. weightedRidge lets fresh data -- including the
+      // implicit recalibration from dwellSelect({calibrate:true}) below
+      // -- gradually take over from the original calibration.
+      cameraConstraints: {
+        width: { min: 320, ideal: 1280, max: 1920 },
+        height: { min: 240, ideal: 720, max: 1080 },
+        facingMode: 'user'
+      },
+      // Left unset, getUserMedia gets no resolution hint and a lot of
+      // webcams default to a fairly small capture size. The FaceMesh eye
+      // landmarks -- and therefore the eye-corner distances the
+      // regression model is trained on -- are measurably less precise at
+      // low resolution, especially at normal laptop-webcam distance.
+      // "ideal" (not a hard minimum) degrades gracefully on hardware that
+      // can't do 720p.
       // WebGazer's TFFacemesh tracker (MediaPipe FaceMesh) loads its model
       // files at runtime from `webgazer.params.faceMeshSolutionPath`, which
       // defaults to the *relative* path './mediapipe/face_mesh'. Relative
@@ -170,9 +218,16 @@
       webgazer.params.faceMeshSolutionPath = self.opts.faceMeshSolutionPath;
     }
 
-    webgazer.setRegression('ridge');
+    webgazer.setRegression(self.opts.regression);
     if (webgazer.setTracker) { try { webgazer.setTracker(useTracker); } catch (e) {} }
     if (webgazer.saveDataAcrossSessions) webgazer.saveDataAcrossSessions(false);
+    // Ask for a higher-resolution capture before the camera opens.
+    if (webgazer.setCameraConstraints && self.opts.cameraConstraints) {
+      try { webgazer.setCameraConstraints(self.opts.cameraConstraints); } catch (e) {}
+    }
+    // Already the WebGazer default -- set explicitly so this doesn't
+    // silently depend on a default that could change in a future build.
+    if (webgazer.applyKalmanFilter) { try { webgazer.applyKalmanFilter(true); } catch (e) {} }
 
     var began;
     try {
@@ -389,6 +444,61 @@
     this._emit('calibration-feed', { x: x, y: y });
   };
 
+  // Runs one full "look at (x, y) until it's calibrated" cycle: waits
+  // `settleMs` for the eye to saccade to the new point and fixate, THEN
+  // starts calling feedCalibrationPoint() every `sampleEveryMs` for the
+  // remainder of `ms`. Skips samples on any frame where eyes are closed.
+  // A deliberate blink counts as a "yes, I'm looking here" confirmation
+  // and adds bonus progress, same as an extra click would in manual mode.
+  //
+  // The settle delay is the important part, not a nicety: hands-free
+  // calibration has no click to mark "the eye has arrived" the way manual
+  // click-calibration does. Without a settle window, every sample taken
+  // in the first couple hundred milliseconds after a new point appears is
+  // still labelled with the *previous* point's screen position while the
+  // eye is physically mid-saccade -- that mislabeled data trains the
+  // regression model right alongside the good data, on every single dot.
+  //
+  // Returns a cancel() function that stops the cycle early (e.g. the
+  // calibration screen is switched to manual mode, or torn down).
+  P.calibrateDwell = function (x, y, config) {
+    config = Object.assign({
+      ms: 1600,
+      settleMs: 350,
+      sampleEveryMs: 130,
+      onProgress: null,
+      onDone: null
+    }, config);
+
+    var self = this;
+    var elapsed = 0;
+    var bonus = 0;
+
+    var blinkHandler = function () {
+      bonus += config.sampleEveryMs * 3;
+    };
+    self.on('blink', blinkHandler);
+
+    var timer = setInterval(function () {
+      elapsed += config.sampleEveryMs;
+      if (elapsed >= config.settleMs && (!self.eyeState || !self.eyeState.closed)) {
+        self.feedCalibrationPoint(x, y);
+      }
+      var pct = Math.min(1, (elapsed + bonus) / config.ms);
+      if (config.onProgress) config.onProgress(pct);
+      if (pct >= 1) {
+        clearInterval(timer);
+        self.off('blink', blinkHandler);
+        if (config.onDone) config.onDone();
+      }
+    }, config.sampleEveryMs);
+
+    return function cancel() {
+      clearInterval(timer);
+      self.off('blink', blinkHandler);
+    };
+  };
+
   P.clearCalibration = function () {
     if (typeof webgazer !== 'undefined') webgazer.clearData();
   };
@@ -425,8 +535,13 @@
   // long enough and it activates. This is how real eye-gaze AAC devices work.
 
   P.dwellSelect = function (el, config) {
-    config = Object.assign({ ms: 900, onSelect: null, onProgress: null, onEnter: null, onLeave: null }, config);
-    this._dwellTargets.set(el, Object.assign({ _acc: 0, _inside: false, _locked: false }, config));
+    config = Object.assign({
+      ms: 900, onSelect: null, onProgress: null, onEnter: null, onLeave: null,
+      calibrate: false,   // feed a calibration sample at this element's center
+                          // while the user is dwelling on it (see below)
+      calibEveryMs: 180
+    }, config);
+    this._dwellTargets.set(el, Object.assign({ _acc: 0, _inside: false, _locked: false, _calibAcc: 0 }, config));
     var self = this;
     return function () { self.cancelDwell(el); };
   };
@@ -459,6 +574,7 @@
             if (!cfg._inside) {
               cfg._inside = true;
               cfg._acc = 0;
+              cfg._calibAcc = 0;
               cfg._locked = false;
               if (cfg.onEnter) cfg.onEnter();
             }
@@ -466,6 +582,24 @@
               cfg._acc += dt;
               var pct = Math.min(1, cfg._acc / cfg.ms);
               if (cfg.onProgress) cfg.onProgress(pct);
+
+              if (cfg.calibrate) {
+                // The element is itself proof of where the user is
+                // looking -- they're actively dwelling on it -- so every
+                // ongoing dwell doubles as a free, natural calibration
+                // sample. This is the gaze-native equivalent of how
+                // WebGazer normally improves accuracy from real mouse
+                // clicks on an ordinary webpage; re-reading the rect each
+                // time also keeps this correct for moving targets.
+                cfg._calibAcc += dt;
+                if (cfg._calibAcc >= cfg.calibEveryMs) {
+                  cfg._calibAcc = 0;
+                  if (!self.eyeState || !self.eyeState.closed) {
+                    self.feedCalibrationPoint((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+                  }
+                }
+              }
+
               if (pct >= 1) {
                 cfg._locked = true;
                 if (cfg.onSelect) cfg.onSelect();
@@ -474,6 +608,7 @@
           } else if (cfg._inside) {
             cfg._inside = false;
             cfg._acc = 0;
+            cfg._calibAcc = 0;
             cfg._locked = false;
             if (cfg.onLeave) cfg.onLeave();
             if (cfg.onProgress) cfg.onProgress(0);
