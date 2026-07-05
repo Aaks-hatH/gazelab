@@ -101,20 +101,56 @@
 
   P.start = function () {
     var self = this;
+
     if (typeof webgazer === 'undefined') {
-      return Promise.reject(new Error('GazeEngine requires webgazer.js to be loaded on the page first.'));
+      return Promise.reject(new Error('WebGazer failed to load (check your connection and reload the page).'));
     }
+    if (!window.isSecureContext) {
+      return Promise.reject(new Error('Camera access requires HTTPS (or localhost). This page is not running in a secure context.'));
+    }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      return Promise.reject(new Error('This browser does not support camera access.'));
+    }
+
+    // Ask for the camera ourselves first, instead of letting WebGazer do it
+    // internally. This gives us a real, specific error (permission denied, no
+    // camera, camera already in use, etc.) instead of a silent hang, which is
+    // the actual root cause of "allow was clicked but nothing happens": WebGazer's
+    // own begin() can stall indefinitely if its tracking model fails to load,
+    // with zero feedback to the page.
+    return navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 320 }, height: { ideal: 240 } }
+    }).then(function (stream) {
+      stream.getTracks().forEach(function (t) { t.stop(); });
+      return self._bootWebgazer();
+    });
+  };
+
+  P._bootWebgazer = function () {
+    var self = this;
 
     webgazer.setRegression('ridge');
     if (webgazer.setTracker) { try { webgazer.setTracker(self.opts.trackerType); } catch (e) {} }
     if (webgazer.saveDataAcrossSessions) webgazer.saveDataAcrossSessions(false);
 
-    return webgazer.begin().then(function () {
+    var began = webgazer.begin();
+    // Race begin() against a timeout: if the tracking model can't load (slow
+    // network, blocked CDN, low-power mobile device) begin() otherwise never
+    // resolves and the UI is stuck forever on "Requesting camera...".
+    var timeout = new Promise(function (_, reject) {
+      setTimeout(function () {
+        reject(new Error('Camera timed out starting up. Check your connection and try again.'));
+      }, 20000);
+    });
+
+    return Promise.race([began, timeout]).then(function () {
       webgazer.showVideoPreview(true);
       webgazer.showPredictionPoints(false);
       webgazer.showFaceOverlay(false);
       webgazer.showFaceFeedbackBox(false);
       webgazer.clearData();
+
+      self._fixMobileVideo();
 
       webgazer.setGazeListener(function (data) {
         if (!data) return;
@@ -127,6 +163,20 @@
       self._emit('ready');
       return self;
     });
+  };
+
+  // iOS Safari (and some Android WebViews) refuse to actually play a <video>
+  // element unless it is muted + playsinline. WebGazer's internal video feed
+  // sets neither, so on mobile the camera light turns on (permission granted)
+  // but the video frame never advances and no gaze data ever arrives.
+  P._fixMobileVideo = function () {
+    var vid = document.getElementById('webgazerVideoFeed');
+    if (!vid) return;
+    vid.setAttribute('playsinline', 'true');
+    vid.setAttribute('webkit-playsinline', 'true');
+    vid.muted = true;
+    var p = vid.play();
+    if (p && p.catch) p.catch(function () {});
   };
 
   P.pause = function () { if (typeof webgazer !== 'undefined') webgazer.pause(); };
