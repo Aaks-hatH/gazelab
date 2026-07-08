@@ -145,7 +145,21 @@
       earOpenRatio: 0.78,     // eyes count as "open" again once EAR > baseline * this (hysteresis avoids flicker right at the edge)
       blinkMinMs: 60,         // closures shorter than this are treated as sensor noise, not a real blink
       blinkMaxMs: 400,        // closures longer than this are a sustained close, not a blink
-      earBaselineAlpha: 0.02  // how fast the rolling "eyes open" baseline adapts (per frame)
+      earBaselineAlpha: 0.02, // how fast the rolling "eyes open" baseline adapts (per frame)
+
+      // ---- scan-select (blink-confirmed switch scanning) ----
+      // A second, independent selection path that never touches (x,y) gaze
+      // prediction at all -- it only needs "are the eyes open or closed",
+      // which the EAR signal above is already good at. A highlight advances
+      // through a list on a timer; holding eyes shut for `holdMs` selects
+      // whatever is currently highlighted. This is the standard AAC
+      // switch-scanning pattern (the interaction Aloud/hackjps uses instead
+      // of pixel-level gaze pointing) and its accuracy has a hard floor of
+      // "did you correctly detect a closed eye", not "did a linear
+      // regression correctly guess your screen pixel".
+      scanStepMs: 900,        // how long each item stays highlighted
+      scanHoldMs: 550,        // how long eyes must stay closed to count as a select
+      scanRefireMs: 700       // cooldown after a select before another can fire
     }, opts || {});
 
     this._listeners = {};
@@ -158,6 +172,8 @@
     this._eyeLoopRAF = null;
     this._earBaseline = null;
     this._eyeClosedSince = null;
+    this._scanTimer = null;
+    this._scanState = null;
     this._started = false;
     this.current = null; // last smoothed {x,y}
     // Live eye-openness read: ear (raw ratio), open/closed (debounced state),
@@ -411,6 +427,7 @@
         self.eyeState.closed = true;
         self._eyeClosedSince = now;
         self._sustainedFired = false;
+        self._emit('eyes-closed-start', {});
       } else if (self.eyeState.closed && ear > openThresh) {
         self.eyeState.closed = false;
         var closedMs = now - self._eyeClosedSince;
@@ -517,6 +534,66 @@
     if (typeof webgazer !== 'undefined') webgazer.clearData();
   };
 
+  // Personalizes the open/closed EAR thresholds instead of trusting the
+  // fixed 0.62 / 0.78 ratio guesses -- faces, cameras and lighting vary
+  // enough that a fixed ratio is either too twitchy (false blinks) or too
+  // numb (missed ones) for a lot of people. Ask the user to hold their eyes
+  // open for a beat, then closed for a beat; take the percentile gap
+  // between those two real samples and split the difference. Same idea as
+  // Aloud/hackjps's blink.mjs calibrator, just operating on this engine's
+  // EAR signal instead of a blendshape score.
+  P.calibrateBlink = function (config) {
+    config = Object.assign({ openMs: 1500, closedMs: 1500, onPhase: null }, config);
+    var self = this;
+
+    function percentile(arr, p) {
+      if (!arr.length) return null;
+      var s = arr.slice().sort(function (a, b) { return a - b; });
+      var i = Math.min(s.length - 1, Math.max(0, Math.round((p / 100) * (s.length - 1))));
+      return s[i];
+    }
+
+    return new Promise(function (resolve) {
+      var openSamples = [], closedSamples = [];
+      if (config.onPhase) config.onPhase('open');
+      var collectOpen = setInterval(function () {
+        if (self.eyeState.ear != null && !self.eyeState.closed) openSamples.push(self.eyeState.ear);
+      }, 50);
+
+      setTimeout(function () {
+        clearInterval(collectOpen);
+        if (config.onPhase) config.onPhase('closed');
+        var collectClosed = setInterval(function () {
+          // During this phase the user is deliberately holding their eyes
+          // shut, so unlike normal runtime we WANT samples regardless of
+          // the (not-yet-recalibrated) closed/open debounce state.
+          if (self.eyeState.ear != null) closedSamples.push(self.eyeState.ear);
+        }, 50);
+
+        setTimeout(function () {
+          clearInterval(collectClosed);
+          var baseline = self._earBaseline || percentile(openSamples, 50) || 1;
+          var openP = percentile(openSamples, 15);   // low end of "open" samples
+          var closedP = percentile(closedSamples, 85); // high end of "closed" samples
+
+          var result = null;
+          if (openP != null && closedP != null && openP > closedP) {
+            var gap = openP - closedP;
+            // ratios relative to baseline, matching how the runtime loop
+            // already compares live EAR against self._earBaseline
+            var closedRatio = Math.min(0.85, Math.max(0.35, (closedP + gap * 0.5) / baseline));
+            var openRatio = Math.min(closedRatio - 0.05, Math.max(0.5, (closedP + gap * 0.72) / baseline));
+            result = { earClosedRatio: closedRatio, earOpenRatio: openRatio };
+            self.opts.earClosedRatio = closedRatio;
+            self.opts.earOpenRatio = openRatio;
+          }
+          if (config.onPhase) config.onPhase('done');
+          resolve(result); // null means samples were too noisy/close to trust -- caller should keep defaults
+        }, config.closedMs);
+      }, config.openMs);
+    });
+  };
+
   // Shows how accurate current calibration is: samples gaze for `sampleMs` while
   // the caller displays something at (xFrac, yFrac) of the viewport, and resolves
   // with the average pixel error.
@@ -558,6 +635,88 @@
     this._dwellTargets.set(el, Object.assign({ _acc: 0, _inside: false, _locked: false, _calibAcc: 0 }, config));
     var self = this;
     return function () { self.cancelDwell(el); };
+  };
+
+  /* ---------------- scan-select ---------------- */
+  // Blink-confirmed switch scanning: a highlight advances through `items`
+  // on a timer, and holding your eyes shut selects whatever it's currently
+  // on. Unlike dwellSelect, this never reads gaze (x,y) at all -- it only
+  // needs the eyes-open/closed signal, which is a far more solvable
+  // problem on a webcam than pixel-accurate pointing. Use this for any
+  // interaction where WebGazer's cursor isn't reliable enough to trust
+  // (which, realistically, is most laptop-webcam setups).
+  //
+  //   var stop = gaze.scanSelect(tileElements, {
+  //     onHighlight: (el, i) => el.classList.add('scanning'),
+  //     onUnhighlight: (el, i) => el.classList.remove('scanning'),
+  //     onSelect: (el, i) => speak(el.textContent)
+  //   });
+  //   stop(); // tears down the timer + listeners
+  P.scanSelect = function (items, config) {
+    config = Object.assign({
+      stepMs: this.opts.scanStepMs,
+      holdMs: this.opts.scanHoldMs,
+      refireMs: this.opts.scanRefireMs,
+      loop: true,
+      onHighlight: null,
+      onUnhighlight: null,
+      onSelect: null
+    }, config);
+
+    var self = this;
+    var idx = -1;
+    var lastFire = 0;
+    var fired = false;
+
+    function highlight(next) {
+      if (idx >= 0 && items[idx] && config.onUnhighlight) config.onUnhighlight(items[idx], idx);
+      idx = next;
+      if (items[idx] && config.onHighlight) config.onHighlight(items[idx], idx);
+    }
+
+    function advance() {
+      if (!items.length) return;
+      var next = idx + 1;
+      if (next >= items.length) {
+        if (!config.loop) { stop(); return; }
+        next = 0;
+      }
+      highlight(next);
+    }
+
+    var stepTimer = setInterval(advance, config.stepMs);
+    advance();
+
+    // Reuses the same EAR-based closed/open state the dwell/blink events
+    // already run off of -- a sustained closure of >= holdMs, gated by a
+    // refire cooldown so one long blink doesn't fire twice.
+    var eyesClosedHandler = function () { fired = false; };
+    var eyesOpenHandler = function () { fired = false; };
+    self.on('eyes-closed-start', eyesClosedHandler);
+    self.on('eyes-open', eyesOpenHandler);
+
+    function pollHold() {
+      if (self.eyeState.closed && self._eyeClosedSince && !fired) {
+        var held = performance.now() - self._eyeClosedSince;
+        var since = performance.now() - lastFire;
+        if (held >= config.holdMs && since >= config.refireMs) {
+          fired = true;
+          lastFire = performance.now();
+          if (items[idx] && config.onSelect) config.onSelect(items[idx], idx);
+        }
+      }
+    }
+    var holdTimer = setInterval(pollHold, 50);
+
+    function stop() {
+      clearInterval(stepTimer);
+      clearInterval(holdTimer);
+      self.off('eyes-closed-start', eyesClosedHandler);
+      self.off('eyes-open', eyesOpenHandler);
+      if (idx >= 0 && items[idx] && config.onUnhighlight) config.onUnhighlight(items[idx], idx);
+    }
+
+    return stop;
   };
 
   P.cancelDwell = function (el) {
