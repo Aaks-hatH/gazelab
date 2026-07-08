@@ -417,10 +417,9 @@
     <div class="caption" id="camCaption">Camera preview</div>
   </div>
 
-  <footer class="credit">Runs entirely in this browser tab — powered by WebGazer.js</footer>
+  <footer class="credit">Runs entirely in this browser tab — powered by MediaPipe FaceLandmarker</footer>
 
-  <script src="https://webgazer.cs.brown.edu/webgazer.js"></script>
-  <script src="gaze-engine.js"></script>
+  <script src="mp-gaze-engine.js"></script>
   <script>
   (function () {
     'use strict';
@@ -452,7 +451,7 @@
     var gazeCanvas = $('gazeCanvas');
     var gctx = gazeCanvas.getContext('2d');
 
-    var gaze = new GazeEngine();
+    var gaze = new MPGazeEngine();
 
     var state = { calibCounts: [], testResults: [], targetIndex: 0 };
     var trail = [];
