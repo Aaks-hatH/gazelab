@@ -115,6 +115,10 @@
   .calib-dot.pulse .core{ transform:scale(1.5); }
   .calib-dot.done .core{ background:var(--accent); }
 
+  /* ---------- blink setup ---------- */
+  .blink-meter{ width:260px; height:6px; background:var(--line); border-radius:3px; margin:32px auto 0; overflow:hidden; }
+  .blink-meter i{ display:block; height:100%; width:0%; background:var(--accent); transition:width .08s linear; }
+
   /* ---------- test ---------- */
   #screen-test{ padding:0; }
   .test-hud{ position:absolute; top:96px; left:0; right:0; text-align:center; z-index:20; }
@@ -202,6 +206,10 @@
   .tile.locked{ border-color:var(--accent); }
   .tile.locked .fill{ background:var(--accent); }
   .tile.locked .label{ color:#fff; }
+  /* scan-select highlight: the tile currently lit by the auto-advancing
+     scanner, independent of anything WebGazer predicted */
+  .tile.scanning{ border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .tile.scanning .fill{ height:100%; opacity:.35; transition:height var(--scan-step, .9s) linear; }
   .tile .emoji{ position:relative; z-index:1; font-size:26px; display:block; margin-bottom:4px; }
   #dwellSpeech{
     position:absolute; bottom:70px; left:0; right:0; text-align:center; z-index:20;
@@ -280,6 +288,17 @@
       </p>
       <button class="btn" id="btnStart">Enable camera &amp; begin</button>
       <div id="introError"></div>
+    </section>
+
+    <!-- BLINK SETUP -->
+    <section class="screen" id="screen-blink-calib">
+      <div class="eyebrow">Eye-closure setup</div>
+      <h1 class="title" id="blinkCalibTitle">Keep your eyes<br><em>open, relaxed.</em></h1>
+      <p class="lede" id="blinkCalibLede">
+        A quick two-part check tunes blink detection to your eyes, camera and lighting. This also drives every stare-to-select interaction later, so getting it right matters.
+      </p>
+      <div class="blink-meter"><i id="blinkMeterFill"></i></div>
+      <button class="btn ghost" id="btnSkipBlinkCalib">Skip for now</button>
     </section>
 
     <!-- CALIBRATION -->
@@ -488,8 +507,8 @@
         window.removeEventListener('error', onWindowError);
         body.classList.add('camera-on');
         $('statusText').textContent = 'calibrating';
-        showScreen('screen-calib');
-        startCalibration();
+        showScreen('screen-blink-calib');
+        runBlinkCalibScreen();
       }).catch(function (err) {
         if (settled) return;
         settled = true;
@@ -506,6 +525,75 @@
       location.reload();
     });
 
+    /* ---------- blink setup ---------- */
+    var blinkMeterFill = $('blinkMeterFill');
+    var blinkCalibTitle = $('blinkCalibTitle');
+    var blinkCalibLede = $('blinkCalibLede');
+    var btnSkipBlinkCalib = $('btnSkipBlinkCalib');
+    var BLINK_PHASE_MS = { open: 1600, closed: 1400 };
+    var BLINK_COPY = {
+      open: { title: 'Keep your eyes<br><em>open, relaxed.</em>', lede: 'Just look at the screen normally for a moment.' },
+      closed: { title: 'Now close your<br><em>eyes and hold.</em>', lede: 'Keep them shut until this screen moves on.' },
+      done: { title: 'Got it —<br><em>tuned to you.</em>', lede: 'Blink detection is now personalized. Moving on to the point calibration.' }
+    };
+    var blinkMeterRAF = null;
+    var blinkSkipped = false;
+
+    function animateBlinkMeter(phase, durationMs) {
+      var start = performance.now();
+      function step() {
+        var pct = Math.min(1, (performance.now() - start) / durationMs);
+        blinkMeterFill.style.width = (pct * 100) + '%';
+        if (pct < 1 && phaseIsCurrent(phase)) blinkMeterRAF = requestAnimationFrame(step);
+      }
+      step();
+    }
+    var currentBlinkPhase = null;
+    function phaseIsCurrent(p) { return currentBlinkPhase === p; }
+
+    function runBlinkCalibScreen() {
+      blinkSkipped = false;
+      btnSkipBlinkCalib.disabled = false;
+      currentBlinkPhase = 'open';
+      blinkCalibTitle.innerHTML = BLINK_COPY.open.title;
+      blinkCalibLede.textContent = BLINK_COPY.open.lede;
+      blinkMeterFill.style.width = '0%';
+      animateBlinkMeter('open', BLINK_PHASE_MS.open);
+
+      gaze.calibrateBlink({
+        openMs: BLINK_PHASE_MS.open,
+        closedMs: BLINK_PHASE_MS.closed,
+        onPhase: function (phase) {
+          if (blinkSkipped) return;
+          currentBlinkPhase = phase;
+          if (phase === 'closed') {
+            blinkCalibTitle.innerHTML = BLINK_COPY.closed.title;
+            blinkCalibLede.textContent = BLINK_COPY.closed.lede;
+            blinkMeterFill.style.width = '0%';
+            animateBlinkMeter('closed', BLINK_PHASE_MS.closed);
+          } else if (phase === 'done') {
+            blinkCalibTitle.innerHTML = BLINK_COPY.done.title;
+            blinkCalibLede.textContent = BLINK_COPY.done.lede;
+            blinkMeterFill.style.width = '100%';
+            btnSkipBlinkCalib.disabled = true;
+            setTimeout(function () {
+              if (blinkSkipped) return;
+              showScreen('screen-calib');
+              startCalibration();
+            }, 1100);
+          }
+        }
+      });
+    }
+
+    btnSkipBlinkCalib.addEventListener('click', function () {
+      blinkSkipped = true;
+      currentBlinkPhase = null;
+      if (blinkMeterRAF) cancelAnimationFrame(blinkMeterRAF);
+      showScreen('screen-calib');
+      startCalibration();
+    });
+
     /* ---------- calibration ---------- */
     var calibGrid = $('calibGrid');
     var calibHint = $('calibHint');
@@ -514,7 +602,11 @@
     var AUTO_DOT_MS = 1900;         // total time spent per dot in hands-free mode
     var AUTO_SETTLE_MS = 350;       // time given to saccade to a new dot + fixate before any sample counts
     var AUTO_SAMPLE_EVERY_MS = 130; // how often we feed a training sample once settled
-    var calibMode = 'auto';         // 'auto' (hands-free, default) or 'manual' (click each dot)
+    var calibMode = 'manual';       // 'manual' (click each dot, default -- WebGazer's regression was
+                                     // validated against real click coordinates, and manual mode is the
+                                     // only one that can guarantee the eye was actually on the dot when
+                                     // a sample was recorded) or 'auto' (hands-free, opt-in; faster but
+                                     // trains on assumed rather than confirmed fixation)
     var autoCalib = { cancel: null };
 
     var CALIB_HINT_TEXT = {
@@ -880,29 +972,31 @@
       });
     }
 
+    // Switch-scanning instead of gaze-cursor dwell: a highlight moves
+    // through the tiles on its own, and holding your eyes shut for
+    // ~550ms selects whichever tile is lit. This is the same interaction
+    // Aloud/hackjps uses -- it only needs "did we detect a closed eye",
+    // not "did WebGazer's regression land the cursor inside this tile",
+    // so it keeps working even when the pixel-level gaze cursor doesn't.
+    var dwellStop = null;
     function startDwellBoard() {
       buildDwellBoard();
       body.classList.add('testing');
       startCanvasLoop();
-      dwellTiles.forEach(function (t) {
-        gaze.dwellSelect(t.el, {
-          ms: 800,
-          calibrate: true, // every completed dwell is a free, natural recalibration sample
-          onProgress: function (pct) { t.el.querySelector('.fill').style.height = (pct * 100) + '%'; },
-          onSelect: function () {
-            t.el.classList.add('locked');
-            $('dwellSpeech').textContent = t.word;
-            speak(t.word);
-            setTimeout(function () {
-              t.el.classList.remove('locked');
-              t.el.querySelector('.fill').style.height = '0%';
-            }, 700);
-          }
-        });
+      dwellStop = gaze.scanSelect(dwellTiles.map(function (t) { return t.el; }), {
+        onHighlight: function (el) { el.classList.add('scanning'); },
+        onUnhighlight: function (el) { el.classList.remove('scanning'); },
+        onSelect: function (el) {
+          var t = dwellTiles.find(function (t) { return t.el === el; });
+          el.classList.add('locked');
+          $('dwellSpeech').textContent = t.word;
+          speak(t.word);
+          setTimeout(function () { el.classList.remove('locked'); }, 700);
+        }
       });
     }
     function stopDwellBoard() {
-      dwellTiles.forEach(function (t) { gaze.cancelDwell(t.el); });
+      if (dwellStop) { dwellStop(); dwellStop = null; }
       $('dwellSpeech').textContent = '';
       body.classList.remove('testing');
       stopCanvasLoop();
